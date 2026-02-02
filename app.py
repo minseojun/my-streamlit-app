@@ -15,9 +15,6 @@ GENRE_MAP = {
     "코미디": {"label": "코미디", "tmdb_ids": [35]},
 }
 
-# -----------------------------
-# 질문/선택지 (각 선택지 = 장르 성향)
-# -----------------------------
 questions = [
     {
         "q": "1) 오랜만에 시간이 비었어. 오늘 밤, 너는 어떤 무드로 영화를 보고 싶어?",
@@ -70,18 +67,12 @@ questions = [
 # 헬퍼 함수
 # -----------------------------
 def analyze_answers(selected_labels):
-    """
-    selected_labels: ["로맨스/드라마", "액션/어드벤처", ...] 길이 5
-    최다 선택 장르를 반환. 동점이면 우선순위로 결정.
-    """
+    """최다 선택 장르 반환(동점이면 우선순위 적용)"""
     scores = {k: 0 for k in GENRE_MAP.keys()}
     for label in selected_labels:
-        if label in scores:
-            scores[label] += 1
+        scores[label] += 1
 
-    # 동점 처리 우선순위(원하면 바꿔도 됨)
     priority = ["로맨스/드라마", "액션/어드벤처", "SF/판타지", "코미디"]
-
     max_score = max(scores.values())
     top = [k for k, v in scores.items() if v == max_score]
     for p in priority:
@@ -90,41 +81,52 @@ def analyze_answers(selected_labels):
     return top[0], scores
 
 
-def discover_movies_by_genre(api_key, genre_ids, limit=5):
+def discover_movies_by_genre(api_key, genre_ids, min_rating=0.0, limit=5):
     """
-    genre_ids: [28] 또는 [10749, 18] 등
-    with_genres는 콤마로 결합 가능(AND 성격으로 동작하는 경우가 있어 결과가 적을 수 있음).
-    그래서:
-    - 로맨스/드라마, SF/판타지처럼 2개 장르를 묶는 경우: 콤마 AND가 너무 빡세면 fallback으로 첫 번째만 사용.
+    TMDB discover로 인기 영화 가져오기 + 평점 필터 적용
+    - vote_average.gte = min_rating
+    - 결과가 5개 미만이면 페이지 넘겨가며 채움(최대 몇 페이지까지만)
     """
     base_url = "https://api.themoviedb.org/3/discover/movie"
-    params = {
-        "api_key": api_key,
-        "language": "ko-KR",
-        "sort_by": "popularity.desc",
-        "include_adult": "false",
-        "include_video": "false",
-        "page": 1,
-        "with_genres": ",".join(map(str, genre_ids)),
-    }
+    movies = []
+    page = 1
+    max_pages = 5  # 너무 오래 돌지 않도록 제한
 
-    r = requests.get(base_url, params=params, timeout=15)
-    r.raise_for_status()
-    data = r.json()
-    results = data.get("results", [])
+    # 1차: 장르 ids 콤마(AND 조건)로 시도
+    def fetch(with_genres_value, page_no):
+        params = {
+            "api_key": api_key,
+            "language": "ko-KR",
+            "sort_by": "popularity.desc",
+            "include_adult": "false",
+            "include_video": "false",
+            "page": page_no,
+            "with_genres": with_genres_value,
+            "vote_average.gte": float(min_rating),
+            "vote_count.gte": 50,  # 평점 신뢰도(너무 소수표본 방지) - 필요 없으면 제거 가능
+        }
+        r = requests.get(base_url, params=params, timeout=15)
+        r.raise_for_status()
+        return r.json().get("results", [])
 
-    # 결과가 너무 적으면(AND 조건이 빡셈) 첫 장르로만 재시도
-    if len(results) < limit and len(genre_ids) > 1:
-        params["with_genres"] = str(genre_ids[0])
-        r2 = requests.get(base_url, params=params, timeout=15)
-        r2.raise_for_status()
-        results = r2.json().get("results", [])
+    with_genres = ",".join(map(str, genre_ids))
+    while len(movies) < limit and page <= max_pages:
+        movies.extend(fetch(with_genres, page))
+        page += 1
 
-    return results[:limit]
+    # 결과가 부족하고 장르가 2개 이상이면(AND가 빡셈) 첫 장르만으로 fallback
+    if len(movies) < limit and len(genre_ids) > 1:
+        movies = []
+        page = 1
+        with_genres = str(genre_ids[0])
+        while len(movies) < limit and page <= max_pages:
+            movies.extend(fetch(with_genres, page))
+            page += 1
+
+    return movies[:limit]
 
 
 def reason_text(genre_label, scores):
-    """간단 추천 이유 문구"""
     if genre_label == "로맨스/드라마":
         return f"감정선과 공감 포인트를 고른 선택이 많았어요(선택 {scores[genre_label]}개). 잔잔하게 몰입하는 이야기가 잘 맞아요."
     if genre_label == "액션/어드벤처":
@@ -143,16 +145,29 @@ def safe_text(x, fallback="정보 없음"):
     return x if x else fallback
 
 
+def simple_movie_reason(best_genre):
+    if best_genre == "로맨스/드라마":
+        return "감정선과 여운이 기대되는 작품이에요."
+    if best_genre == "액션/어드벤처":
+        return "몰입감 있는 전개로 스트레스 해소에 좋아요."
+    if best_genre == "SF/판타지":
+        return "세계관/설정이 매력적인 작품일 확률이 높아요."
+    return "가볍게 즐기며 기분 전환하기 좋아요."
+
+
 # -----------------------------
 # UI: 헤더/소개
 # -----------------------------
 st.title("🎬 나와 어울리는 영화는?")
 st.write("5개의 질문에 답하면, 당신과 가장 잘 맞는 영화 장르와 인기 영화를 추천해드려요! 🍿")
 
-# 사이드바: TMDB API Key 입력
-st.sidebar.header("🔑 TMDB 설정")
+# -----------------------------
+# 사이드바: TMDB + 평점 필터
+# -----------------------------
+st.sidebar.header("🔧 추천 설정")
 TMDB_API_KEY = st.sidebar.text_input("TMDB API Key", type="password")
-st.sidebar.caption("TMDB API Key를 입력해야 영화 추천을 불러올 수 있어요.")
+min_rating = st.sidebar.slider("최소 평점 필터", min_value=0.0, max_value=10.0, value=6.5, step=0.5)
+st.sidebar.caption("최소 평점 이상인 영화만 추천해요. (TMDB vote_average 기준)")
 
 # -----------------------------
 # 질문 UI
@@ -162,15 +177,8 @@ st.subheader("📝 질문에 답해 주세요")
 selected_labels = []
 for idx, item in enumerate(questions, start=1):
     option_texts = [t for (t, _label) in item["options"]]
+    choice = st.radio(item["q"], option_texts, index=None, key=f"q_{idx}")
 
-    choice = st.radio(
-        item["q"],
-        option_texts,
-        index=None,
-        key=f"q_{idx}",
-    )
-
-    # 선택된 선택지의 장르 레이블 저장
     if choice is None:
         selected_labels.append(None)
     else:
@@ -180,12 +188,11 @@ for idx, item in enumerate(questions, start=1):
 st.divider()
 
 # -----------------------------
-# 결과 보기 버튼 동작
+# 결과 보기 버튼
 # -----------------------------
 col_a, col_b = st.columns([1, 3])
 with col_a:
     clicked = st.button("결과 보기", type="primary")
-
 with col_b:
     st.caption("※ 모든 질문에 답하고, 사이드바에 TMDB API Key를 입력하면 추천 영화 5개를 보여줘요.")
 
@@ -210,19 +217,22 @@ if clicked:
             movies = discover_movies_by_genre(
                 api_key=TMDB_API_KEY,
                 genre_ids=genre_info["tmdb_ids"],
-                limit=5
+                min_rating=min_rating,
+                limit=5,
             )
         except requests.RequestException as e:
             st.error(f"TMDB 호출 중 오류가 발생했어요: {e}")
             st.stop()
 
-    # 5) 결과 화면 예쁘게
+    # 5) 결과 화면
     st.markdown(f"## ✨ 당신에게 딱인 장르는: **{genre_info['label']}**!")
     st.write("🎯 **이 장르를 추천하는 이유**")
     st.success(reason_text(best_genre, scores))
 
+    st.caption(f"🔎 현재 필터: 최소 평점 **{min_rating:.1f}** 이상")
+
     if not movies:
-        st.warning("추천할 영화 데이터를 찾지 못했어요. (장르 조건이 까다롭거나 언어 설정 영향일 수 있어요)")
+        st.warning("조건에 맞는 영화가 부족해요 😢  \n평점 필터를 낮추거나(예: 5.5), 다시 시도해 보세요!")
         st.stop()
 
     st.markdown("### 🍿 지금 뜨는 인기 영화 5편")
@@ -235,42 +245,29 @@ if clicked:
             vote = m.get("vote_average")
             overview = safe_text(m.get("overview"), fallback="줄거리 정보가 없어요.")
             poster_path = m.get("poster_path")
+            release_date = safe_text(m.get("release_date"), "개봉일 정보 없음")
 
-            # 카드 UI 느낌 (컨테이너 + 경계)
             with st.container(border=True):
                 # 포스터
                 if poster_path:
                     st.image(f"{POSTER_BASE_URL}{poster_path}", use_container_width=True)
                 else:
-                    st.image(
-                        "https://via.placeholder.com/500x750?text=No+Poster",
-                        use_container_width=True
-                    )
+                    st.image("https://via.placeholder.com/500x750?text=No+Poster", use_container_width=True)
 
                 # 제목/평점
                 st.markdown(f"**{title}**")
                 if vote is not None:
-                    st.caption(f"⭐ 평점: {vote:.1f}/10")
+                    st.caption(f"⭐ 평점: {float(vote):.1f}/10")
                 else:
                     st.caption("⭐ 평점: 정보 없음")
 
                 # 추천 이유(간단)
-                if best_genre == "로맨스/드라마":
-                    why = "감정선과 여운이 기대되는 작품이에요."
-                elif best_genre == "액션/어드벤처":
-                    why = "몰입감 있는 전개로 스트레스 해소에 좋아요."
-                elif best_genre == "SF/판타지":
-                    why = "세계관/설정이 매력적인 작품일 확률이 높아요."
-                else:
-                    why = "가볍게 즐기며 기분 전환하기 좋아요."
-
-                st.write(f"💡 **이 영화를 추천하는 이유:** {why}")
+                st.write(f"💡 **이 영화를 추천하는 이유:** {simple_movie_reason(best_genre)}")
 
                 # 상세 정보 (expander)
                 with st.expander("자세히 보기"):
                     st.write(overview)
-                    release_date = safe_text(m.get("release_date"), "개봉일 정보 없음")
                     st.caption(f"📅 개봉일: {release_date}")
                     popularity = m.get("popularity")
                     if popularity is not None:
-                        st.caption(f"🔥 인기도: {popularity:.0f}")
+                        st.caption(f"🔥 인기도: {float(popularity):.0f}")
