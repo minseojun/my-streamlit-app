@@ -168,25 +168,35 @@ hr {{
 # =========================
 # USER ID (cookie-based)
 # =========================
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+import uuid
+import extra_streamlit_components as stx
+import streamlit as st
+
+KST = ZoneInfo("Asia/Seoul")
+
 def get_or_create_user_id() -> str:
-    # 1) 세션에 이미 있으면 그걸 최우선으로 사용 (리런 안정성 확보)
-    if "user_id" in st.session_state and st.session_state["user_id"]:
+    # 1) 같은 세션(리런 포함)에서는 절대 흔들리지 않게
+    if st.session_state.get("user_id"):
         return st.session_state["user_id"]
 
     cookie = stx.CookieManager()
     uid = cookie.get("failog_uid")
 
-    # 2) 쿠키가 있으면 세션에도 고정
+    # 2) 쿠키가 있으면 세션에 고정
     if uid:
         st.session_state["user_id"] = uid
         return uid
 
-    # 3) 쿠키가 없으면 새로 생성 -> 세션에 먼저 고정 -> 쿠키 저장
+    # 3) 없으면 새로 만들고 -> 세션에 고정 -> 쿠키에 "장기 만료"로 저장
     uid = str(uuid.uuid4())
     st.session_state["user_id"] = uid
-    cookie.set("failog_uid", uid, expires_at=None)
 
-    # 4) 쿠키가 다음 리런에서 안정적으로 읽히도록 한번 리런(선택이지만 권장)
+    expires = datetime.now(KST) + timedelta(days=3650)  # 약 10년
+    cookie.set("failog_uid", uid, expires_at=expires)
+
+    # 4) 쿠키가 다음 런에서 확실히 잡히도록 1회 리런
     st.rerun()
 
 
@@ -1444,4 +1454,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
