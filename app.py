@@ -224,7 +224,7 @@ def month_grid(year: int, month: int) -> List[List[Optional[date]]]:
     nxt = date(year + 1, 1, 1) if month == 12 else date(year, month + 1, 1)
     last = nxt - timedelta(days=1)
 
-    grid: List[List[Optional[date]]]] = []
+    grid: List[List[Optional[date]]] = []
     row: List[Optional[date]] = [None] * 7
 
     day = 1
@@ -1197,3 +1197,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
