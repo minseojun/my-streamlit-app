@@ -1,672 +1,378 @@
-# failog_app.py
-# Streamlit app: failog (계획 실패 기록 → 원인 분류(저장) → 주간 리포트/트렌드/리마인더/코칭)
+# app.py
+# ------------------------------------------------------------
+# 2-screen Streamlit app (깔끔/단순 버전)
+# 1) 메인: 달력형 플래너
+#    - Month(작게) + Current Week(크게)
+#    - 날짜 선택 → 체크리스트(계획 + 습관)
+#    - 계획 추가(해당 날짜 1회성)
+#    - 습관 추가(반복): 월~일 선택 → 해당 주/날짜에 자동 생성
+#    - 각 항목: [성공] / [실패] 버튼
+#      - 실패 누르면 해당 항목 아래에 실패 원인 입력칸 노출 → 저장
+#    - 앱 내부 리마인더(팝업/배너): 설정 시간대에 오늘 todo가 남아있으면 toast + info
 #
-# ✅ 변경 사항(요청 반영)
-# - OpenAI API Key를 "앱에서 입력"해서 동작하도록 수정 (환경변수 의존 X)
-# - 키는 기본적으로 session_state에만 저장(브라우저 세션 종료 시 사라짐)
-# - 원하면 "로컬에 저장(설정 DB)" 옵션을 켤 수 있게 제공(선택)
+# 2) 서브: 실패 화면
+#    - 주간 실패 차트(이번 주 기본, < 버튼으로 이전 주 이동)
+#    - 주간 실패 원인 분석(LLM): 이번 주 실패 이유를 3개 이내로 묶어 요약
+#    - 전체(누적) AI 코칭(LLM): 공통 원인 3개 이내 + 실행 조언 + 2주 이상 반복이면 창의 조언
+#    - 챗봇: 사용자가 질문/대화 가능(코칭 톤 유지)
 #
-# 포함 기능
-# 1) 데일리 체크(성공/실패 + 실패 이유 + 원인 카테고리 저장)
-# 2) 원인 카테고리별 분포/트렌드(주차별 라인차트, 분포 바차트)
-# 3) 습관/목표별 주간 리포트(성공률, 실패 Top 원인, 반복 실패 감지)
-# 4) 알림(리마인더)
-#    - 앱이 열려 있을 때: 설정 시간대에 미체크(pending) 있으면 배너/토스트
-#    - OS/캘린더용: 매일 리마인더 .ics 다운로드
-# 5) 코칭 생성(공통 원인 3개 이내 + 실행가능 조언 + 2주 이상 반복 원인에 창의 대안)
-#    - OpenAI Key 입력 시 LLM 기반
-#    - Key 미입력 시 Local(규칙 기반)로 폴백
+# OpenAI 키
+#  - 하단 입력칸(사이드바 X)
+#  - "로컬 저장" 스위치로 DB 저장 여부 선택(장기 사용)
 #
-# 실행:
-#   pip install streamlit pandas openai streamlit-autorefresh
-#   streamlit run failog_app.py
+# Run:
+#   pip install streamlit pandas openai
+#   streamlit run app.py
+# ------------------------------------------------------------
 
-import re
 import json
+import re
 import sqlite3
-from datetime import datetime, date, timedelta, time
-from typing import Optional, Dict, Any, List, Tuple
+from datetime import date, datetime, timedelta, time
+from typing import Optional, List, Dict, Any, Tuple
 
 import pandas as pd
 import streamlit as st
 
-# Optional: autorefresh for reminder polling
-try:
-    from streamlit_autorefresh import st_autorefresh
-except Exception:
-    st_autorefresh = None
-
-# OpenAI
 try:
     from openai import OpenAI
 except Exception:
     OpenAI = None
 
 
-# -----------------------------
-# Config
-# -----------------------------
-APP_TITLE = "failog — 실패를 실행 전략으로 바꿔주는 코칭"
-DB_PATH = "failog.db"
-DEFAULT_TZ = "Asia/Seoul"
+# =========================
+# 스타일(최소/깔끔)
+# =========================
+def inject_css():
+    st.markdown(
+        """
+<style>
+.block-container { max-width: 1100px; padding-top: 1.1rem; padding-bottom: 2rem; }
+h1,h2,h3 { letter-spacing: -0.02em; }
+.small { color: rgba(49,51,63,0.65); font-size: 0.92rem; }
+.card { border: 1px solid rgba(49,51,63,0.12); border-radius: 16px; padding: 14px 14px; background: rgba(255,255,255,0.9); }
+.pill { display:inline-block; padding:4px 10px; border-radius:999px; border:1px solid rgba(49,51,63,0.14); font-size:0.85rem; margin-right:6px; }
+.pill-strong { background: rgba(0,120,212,0.08); border-color: rgba(0,120,212,0.25); }
+.pill-weak { background: rgba(0,0,0,0.02); }
+.task { border: 1px solid rgba(49,51,63,0.12); border-radius: 14px; padding: 10px 10px; }
+.task + .task { margin-top: 8px; }
+hr { margin: 1.2rem 0; }
+</style>
+""",
+        unsafe_allow_html=True,
+    )
 
 
-# -----------------------------
-# Utilities
-# -----------------------------
-def now_iso():
+# =========================
+# DB (SQLite)
+# =========================
+DB_PATH = "planner.db"
+
+
+def conn():
+    c = sqlite3.connect(DB_PATH, check_same_thread=False)
+    c.execute("PRAGMA foreign_keys = ON;")
+    return c
+
+
+def now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
 
-def today_local() -> date:
-    return date.today()
-
-
-def week_start(d: date) -> date:
-    return d - timedelta(days=d.weekday())
-
-
-def normalize_text(text: str) -> str:
-    t = (text or "").strip().lower()
-    t = re.sub(r"\s+", " ", t)
-    t = re.sub(r"[^\w\s가-힣]", "", t)
-    return t
-
-
-# -----------------------------
-# DB Layer (SQLite) + Migrations
-# -----------------------------
-def get_conn():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.execute("PRAGMA foreign_keys = ON;")
-    return conn
-
-
-def table_columns(conn, table: str) -> List[str]:
-    cur = conn.cursor()
-    cur.execute(f"PRAGMA table_info({table});")
-    return [r[1] for r in cur.fetchall()]
-
-
-def ensure_column(conn, table: str, col: str, ddl_type: str, default_sql: Optional[str] = None):
-    cols = table_columns(conn, table)
-    if col in cols:
-        return
-    dflt = f" DEFAULT {default_sql}" if default_sql is not None else ""
-    conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ddl_type}{dflt};")
-
-
 def init_db():
-    conn = get_conn()
-    cur = conn.cursor()
+    c = conn()
+    cur = c.cursor()
 
-    # plans
+    # 1회성 계획 + 습관으로 생성된 항목 모두 tasks에 저장
     cur.execute(
         """
-        CREATE TABLE IF NOT EXISTS plans (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            title TEXT NOT NULL,
-            active INTEGER NOT NULL DEFAULT 1,
-            created_at TEXT NOT NULL
+        CREATE TABLE IF NOT EXISTS tasks (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          task_date TEXT NOT NULL,
+          text TEXT NOT NULL,
+          source TEXT NOT NULL CHECK(source IN ('plan','habit')),
+          habit_id INTEGER,
+          status TEXT NOT NULL CHECK(status IN ('todo','success','fail')) DEFAULT 'todo',
+          fail_reason TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          UNIQUE(task_date, source, habit_id, text)
         );
         """
     )
 
-    # daily logs (base)
     cur.execute(
         """
-        CREATE TABLE IF NOT EXISTS daily_logs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            log_date TEXT NOT NULL,
-            plan_id INTEGER NOT NULL,
-            status TEXT NOT NULL CHECK(status IN ('pending','success','fail')),
-            reason TEXT,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            UNIQUE(log_date, plan_id),
-            FOREIGN KEY(plan_id) REFERENCES plans(id) ON DELETE CASCADE
+        CREATE TABLE IF NOT EXISTS habits (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          title TEXT NOT NULL,
+          dow_mask TEXT NOT NULL,  -- 7 chars '0'/'1' for Mon..Sun
+          active INTEGER NOT NULL DEFAULT 1,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
         );
         """
     )
 
-    # taxonomy
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS cause_taxonomy (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL UNIQUE,
-            description TEXT,
-            keywords TEXT,
-            active INTEGER NOT NULL DEFAULT 1,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        );
-        """
-    )
-
-    # settings
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS settings (
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL,
-            updated_at TEXT NOT NULL
+          key TEXT PRIMARY KEY,
+          value TEXT NOT NULL,
+          updated_at TEXT NOT NULL
         );
         """
     )
 
-    conn.commit()
-
-    # migrations for daily_logs: cause fields
-    ensure_column(conn, "daily_logs", "cause_name", "TEXT", None)
-    ensure_column(conn, "daily_logs", "cause_source", "TEXT", "'none'")  # user|ai|rule|none
-    ensure_column(conn, "daily_logs", "cause_confidence", "REAL", "0.0")
-    ensure_column(conn, "daily_logs", "cause_updated_at", "TEXT", None)
-
-    conn.commit()
-
-    # seed taxonomy if empty
-    n = cur.execute("SELECT COUNT(*) FROM cause_taxonomy;").fetchone()[0]
-    if n == 0:
-        seed = [
-            ("시간/일정", "회의/야근/이동/마감 등으로 시간이 밀리거나 계획 타이밍이 깨진 경우",
-             ["시간", "야근", "회의", "일정", "약속", "마감", "이동", "출근", "늦"]),
-            ("에너지/컨디션", "피로/수면/컨디션 저하로 실행 에너지가 부족한 경우",
-             ["피곤", "졸림", "잠", "컨디션", "지침", "아파", "두통"]),
-            ("환경/방해요인", "폰/SNS/유튜브/소음/침대 등 방해자극이 강했던 경우",
-             ["폰", "휴대폰", "유튜브", "sns", "방해", "소음", "침대", "게임", "넷플"]),
-            ("계획/설계", "목표가 과도하거나 구체성이 부족해서 시작/유지가 어려웠던 경우",
-             ["너무", "과하게", "무리", "계획", "목표", "분량", "우선순위", "정리"]),
-            ("동기/의미", "의욕 저하/귀찮음/미루기/의미 부족으로 실행이 끊긴 경우",
-             ["의욕", "동기", "귀찮", "하기싫", "의미", "미룸", "미루"]),
-            ("기타(명확화 필요)", "분류가 애매하거나 이유가 불명확한 경우(다음 기록 때 한 문장 더 구체화)", []),
-        ]
-        for name, desc, kws in seed:
-            cur.execute(
-                """
-                INSERT INTO cause_taxonomy (name, description, keywords, active, created_at, updated_at)
-                VALUES (?, ?, ?, 1, ?, ?)
-                """,
-                (name, desc, json.dumps(kws, ensure_ascii=False), now_iso(), now_iso()),
-            )
-        conn.commit()
-
-    # seed settings defaults
-    def set_default(key: str, value: str):
+    # defaults
+    defaults = {
+        "openai_api_key": "",
+        "openai_model": "gpt-4o-mini",
+        "reminder_enabled": "true",
+        "reminder_time": "21:30",       # HH:MM
+        "reminder_window_min": "15",    # minutes
+    }
+    for k, v in defaults.items():
         cur.execute(
-            "INSERT OR IGNORE INTO settings (key, value, updated_at) VALUES (?, ?, ?)",
-            (key, value, now_iso()),
+            "INSERT OR IGNORE INTO settings (key, value, updated_at) VALUES (?,?,?)",
+            (k, v, now_iso()),
         )
 
-    set_default("reminder_enabled", "true")
-    set_default("reminder_time", "21:30")
-    set_default("reminder_window_min", "15")
-    set_default("reminder_poll_sec", "60")
-
-    # optional: store api key (user can choose to enable)
-    set_default("openai_api_key", "")
-    set_default("openai_model", "gpt-4o-mini")
-
-    conn.commit()
-    conn.close()
+    c.commit()
+    c.close()
 
 
-# -----------------------------
-# Settings
-# -----------------------------
-def upsert_setting(key: str, value: str):
-    conn = get_conn()
-    conn.execute(
+def get_setting(key: str, default: str = "") -> str:
+    c = conn()
+    cur = c.cursor()
+    row = cur.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    c.close()
+    return row[0] if row else default
+
+
+def set_setting(key: str, value: str):
+    c = conn()
+    c.execute(
         """
         INSERT INTO settings (key, value, updated_at)
-        VALUES (?, ?, ?)
+        VALUES (?,?,?)
         ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at
         """,
         (key, value, now_iso()),
     )
-    conn.commit()
-    conn.close()
+    c.commit()
+    c.close()
 
 
-def get_setting(key: str, default: str) -> str:
-    conn = get_conn()
-    cur = conn.cursor()
-    row = cur.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
-    conn.close()
-    return row[0] if row else default
+# =========================
+# 날짜/달력 헬퍼 (월~일)
+# =========================
+def week_start(d: date) -> date:
+    return d - timedelta(days=d.weekday())
 
 
-# -----------------------------
-# CRUD
-# -----------------------------
-def add_plan(title: str):
-    conn = get_conn()
-    conn.execute(
-        "INSERT INTO plans (title, active, created_at) VALUES (?, 1, ?)",
-        (title.strip(), now_iso()),
-    )
-    conn.commit()
-    conn.close()
+def week_days(ws: date) -> List[date]:
+    return [ws + timedelta(days=i) for i in range(7)]
 
 
-def set_plan_active(plan_id: int, active: bool):
-    conn = get_conn()
-    conn.execute("UPDATE plans SET active=? WHERE id=?", (1 if active else 0, plan_id))
-    conn.commit()
-    conn.close()
+def korean_dow(i: int) -> str:
+    return ["월", "화", "수", "목", "금", "토", "일"][i]
 
 
-def list_plans(active_only: bool = False) -> pd.DataFrame:
-    conn = get_conn()
-    q = "SELECT id, title, active, created_at FROM plans"
+def month_grid(year: int, month: int) -> List[List[Optional[date]]]:
+    first = date(year, month, 1)
+    first_wd = first.weekday()  # Mon=0
+    if month == 12:
+        nxt = date(year + 1, 1, 1)
+    else:
+        nxt = date(year, month + 1, 1)
+    last = nxt - timedelta(days=1)
+
+    grid: List[List[Optional[date]]] = []
+    row: List[Optional[date]] = [None] * 7
+
+    day = 1
+    idx = first_wd
+    while day <= last.day:
+        row[idx] = date(year, month, day)
+        day += 1
+        idx += 1
+        if idx == 7:
+            grid.append(row)
+            row = [None] * 7
+            idx = 0
+    if any(x is not None for x in row):
+        grid.append(row)
+    return grid
+
+
+# =========================
+# 습관/계획 CRUD + 자동 생성
+# =========================
+def list_habits(active_only: bool = True) -> pd.DataFrame:
+    c = conn()
+    q = "SELECT id, title, dow_mask, active FROM habits"
     if active_only:
         q += " WHERE active=1"
     q += " ORDER BY id DESC"
-    df = pd.read_sql_query(q, conn)
-    conn.close()
+    df = pd.read_sql_query(q, c)
+    c.close()
     return df
 
 
-def ensure_daily_rows(log_date: date):
-    conn = get_conn()
-    cur = conn.cursor()
-    plans = cur.execute("SELECT id FROM plans WHERE active=1").fetchall()
-    for (pid,) in plans:
-        cur.execute(
-            """
-            INSERT OR IGNORE INTO daily_logs
-              (log_date, plan_id, status, reason, created_at, updated_at, cause_name, cause_source, cause_confidence, cause_updated_at)
-            VALUES (?, ?, 'pending', NULL, ?, ?, NULL, 'none', 0.0, NULL)
-            """,
-            (log_date.isoformat(), pid, now_iso(), now_iso()),
-        )
-    conn.commit()
-    conn.close()
+def add_habit(title: str, dows: List[int]):
+    title = (title or "").strip()
+    if not title:
+        return
+    mask = ["0"] * 7
+    for i in dows:
+        if 0 <= i <= 6:
+            mask[i] = "1"
+    dow_mask = "".join(mask)
+
+    c = conn()
+    c.execute(
+        """
+        INSERT INTO habits (title, dow_mask, active, created_at, updated_at)
+        VALUES (?,?,1,?,?)
+        """,
+        (title, dow_mask, now_iso(), now_iso()),
+    )
+    c.commit()
+    c.close()
 
 
-def get_daily_logs(log_date: date) -> pd.DataFrame:
-    conn = get_conn()
+def set_habit_active(habit_id: int, active: bool):
+    c = conn()
+    c.execute(
+        "UPDATE habits SET active=?, updated_at=? WHERE id=?",
+        (1 if active else 0, now_iso(), habit_id),
+    )
+    c.commit()
+    c.close()
+
+
+def ensure_week_habit_tasks(ws: date):
+    """앱 열었을 때: 해당 주에 필요한 습관 항목을 자동으로 tasks에 생성(중복 방지 UNIQUE)."""
+    habits = list_habits(active_only=True)
+    if habits.empty:
+        return
+
+    days = week_days(ws)
+    c = conn()
+    cur = c.cursor()
+
+    for _, h in habits.iterrows():
+        hid = int(h["id"])
+        title = str(h["title"])
+        mask = str(h["dow_mask"] or "0000000")
+        for d in days:
+            if mask[d.weekday()] == "1":
+                cur.execute(
+                    """
+                    INSERT OR IGNORE INTO tasks
+                      (task_date, text, source, habit_id, status, fail_reason, created_at, updated_at)
+                    VALUES (?,?,?,?, 'todo', NULL, ?, ?)
+                    """,
+                    (d.isoformat(), title, "habit", hid, now_iso(), now_iso()),
+                )
+
+    c.commit()
+    c.close()
+
+
+def add_plan_task(d: date, text: str):
+    text = (text or "").strip()
+    if not text:
+        return
+    c = conn()
+    c.execute(
+        """
+        INSERT OR IGNORE INTO tasks
+          (task_date, text, source, habit_id, status, fail_reason, created_at, updated_at)
+        VALUES (?,?,?,?, 'todo', NULL, ?, ?)
+        """,
+        (d.isoformat(), text, "plan", None, now_iso(), now_iso()),
+    )
+    c.commit()
+    c.close()
+
+
+def list_tasks_for_date(d: date) -> pd.DataFrame:
+    c = conn()
     df = pd.read_sql_query(
         """
-        SELECT dl.id, dl.log_date, dl.plan_id, p.title AS plan_title,
-               dl.status, dl.reason,
-               dl.cause_name, dl.cause_source, dl.cause_confidence,
-               dl.updated_at
-        FROM daily_logs dl
-        JOIN plans p ON p.id = dl.plan_id
-        WHERE dl.log_date = ?
-        ORDER BY p.id DESC
+        SELECT id, task_date, text, source, habit_id, status, fail_reason
+        FROM tasks
+        WHERE task_date=?
+        ORDER BY source DESC, id DESC
         """,
-        conn,
-        params=(log_date.isoformat(),),
+        c,
+        params=(d.isoformat(),),
     )
-    conn.close()
+    c.close()
     return df
 
 
-def update_log_success(log_id: int):
-    conn = get_conn()
-    conn.execute(
-        """
-        UPDATE daily_logs
-        SET status='success', reason=NULL,
-            cause_name=NULL, cause_source='none', cause_confidence=0.0, cause_updated_at=NULL,
-            updated_at=?
-        WHERE id=?
-        """,
-        (now_iso(), log_id),
+def update_task_status(task_id: int, status: str):
+    c = conn()
+    c.execute(
+        "UPDATE tasks SET status=?, updated_at=? WHERE id=?",
+        (status, now_iso(), task_id),
     )
-    conn.commit()
-    conn.close()
+    if status != "fail":
+        c.execute("UPDATE tasks SET fail_reason=NULL, updated_at=? WHERE id=?", (now_iso(), task_id))
+    c.commit()
+    c.close()
 
 
-def update_log_fail(
-    log_id: int,
-    reason: str,
-    cause_name: Optional[str],
-    cause_source: str,
-    cause_confidence: float,
-):
-    conn = get_conn()
-    conn.execute(
-        """
-        UPDATE daily_logs
-        SET status='fail', reason=?,
-            cause_name=?, cause_source=?, cause_confidence=?, cause_updated_at=?,
-            updated_at=?
-        WHERE id=?
-        """,
-        (
-            (reason.strip() if reason else "이유 미기록"),
-            cause_name,
-            cause_source,
-            float(cause_confidence),
-            now_iso(),
-            now_iso(),
-            log_id,
-        ),
+def update_task_fail(task_id: int, reason: str):
+    reason = (reason or "").strip()
+    c = conn()
+    c.execute(
+        "UPDATE tasks SET status='fail', fail_reason=?, updated_at=? WHERE id=?",
+        (reason if reason else "이유 미기록", now_iso(), task_id),
     )
-    conn.commit()
-    conn.close()
+    c.commit()
+    c.close()
 
 
-def update_log_pending(log_id: int):
-    conn = get_conn()
-    conn.execute(
-        """
-        UPDATE daily_logs
-        SET status='pending', reason=NULL,
-            cause_name=NULL, cause_source='none', cause_confidence=0.0, cause_updated_at=NULL,
-            updated_at=?
-        WHERE id=?
-        """,
-        (now_iso(), log_id),
-    )
-    conn.commit()
-    conn.close()
-
-
-def get_failures(start_date: date, end_date: date) -> pd.DataFrame:
-    conn = get_conn()
+def get_tasks_range(start_d: date, end_d: date) -> pd.DataFrame:
+    c = conn()
     df = pd.read_sql_query(
         """
-        SELECT dl.id, dl.log_date, dl.plan_id, p.title AS plan_title,
-               dl.reason, dl.cause_name, dl.cause_source, dl.cause_confidence
-        FROM daily_logs dl
-        JOIN plans p ON p.id = dl.plan_id
-        WHERE dl.status='fail'
-          AND dl.log_date BETWEEN ? AND ?
-        ORDER BY dl.log_date ASC
+        SELECT id, task_date, text, source, status, fail_reason
+        FROM tasks
+        WHERE task_date BETWEEN ? AND ?
+        ORDER BY task_date ASC, id DESC
         """,
-        conn,
-        params=(start_date.isoformat(), end_date.isoformat()),
+        c,
+        params=(start_d.isoformat(), end_d.isoformat()),
     )
-    conn.close()
+    c.close()
     return df
 
 
-def get_logs_range(start_date: date, end_date: date, active_only: bool = False) -> pd.DataFrame:
-    conn = get_conn()
-    where_active = "AND p.active=1" if active_only else ""
+def get_all_failures(limit: int = 300) -> pd.DataFrame:
+    c = conn()
     df = pd.read_sql_query(
-        f"""
-        SELECT dl.id, dl.log_date, dl.plan_id, p.title AS plan_title, p.active,
-               dl.status, dl.reason,
-               dl.cause_name, dl.cause_source, dl.cause_confidence
-        FROM daily_logs dl
-        JOIN plans p ON p.id = dl.plan_id
-        WHERE dl.log_date BETWEEN ? AND ?
-        {where_active}
-        ORDER BY dl.log_date ASC, p.id DESC
-        """,
-        conn,
-        params=(start_date.isoformat(), end_date.isoformat()),
-    )
-    conn.close()
-    return df
-
-
-# -----------------------------
-# Taxonomy
-# -----------------------------
-def list_causes(active_only: bool = True) -> pd.DataFrame:
-    conn = get_conn()
-    q = "SELECT id, name, description, keywords, active, updated_at FROM cause_taxonomy"
-    if active_only:
-        q += " WHERE active=1"
-    q += " ORDER BY id ASC"
-    df = pd.read_sql_query(q, conn)
-    conn.close()
-    return df
-
-
-def add_cause(name: str, description: str, keywords_list: List[str]):
-    conn = get_conn()
-    conn.execute(
         """
-        INSERT INTO cause_taxonomy (name, description, keywords, active, created_at, updated_at)
-        VALUES (?, ?, ?, 1, ?, ?)
+        SELECT task_date, text, fail_reason
+        FROM tasks
+        WHERE status='fail'
+        ORDER BY task_date DESC
+        LIMIT ?
         """,
-        (name.strip(), description.strip(), json.dumps(keywords_list, ensure_ascii=False), now_iso(), now_iso()),
+        c,
+        params=(limit,),
     )
-    conn.commit()
-    conn.close()
+    c.close()
+    return df
 
 
-def set_cause_active(cause_id: int, active: bool):
-    conn = get_conn()
-    conn.execute(
-        "UPDATE cause_taxonomy SET active=?, updated_at=? WHERE id=?",
-        (1 if active else 0, now_iso(), cause_id),
-    )
-    conn.commit()
-    conn.close()
-
-
-# -----------------------------
-# OpenAI helpers (KEY INPUT from UI)
-# -----------------------------
-def get_openai_client(api_key: str) -> OpenAI:
-    if OpenAI is None:
-        raise RuntimeError("openai 패키지가 설치되지 않았어요. pip install openai")
-    if not api_key or not api_key.strip():
-        raise RuntimeError("OpenAI API Key가 비어 있어요.")
-    return OpenAI(api_key=api_key.strip())
-
-
-# -----------------------------
-# Classification (OpenAI / Fallback)
-# -----------------------------
-def fallback_classify_reason(reason: str, causes_df: pd.DataFrame) -> Tuple[str, float, str]:
-    r = (reason or "").lower()
-    best = ("기타(명확화 필요)", 0.35)
-    for _, row in causes_df.iterrows():
-        name = row["name"]
-        try:
-            kws = json.loads(row["keywords"] or "[]")
-        except Exception:
-            kws = []
-        if not kws:
-            continue
-        hits = sum(1 for kw in kws if kw and kw.lower() in r)
-        if hits > 0:
-            conf = min(0.55 + 0.1 * hits, 0.9)
-            if conf > best[1]:
-                best = (name, conf)
-    return best[0], best[1], "rule"
-
-
-def openai_classify_reason(api_key: str, model: str, reason: str, cause_names: List[str]) -> Tuple[str, float, str]:
-    client = get_openai_client(api_key)
-    prompt = f"""
-너는 사용자의 '계획 실패 이유'를 아래 원인 카테고리 중 하나로 분류해.
-카테고리 목록: {json.dumps(cause_names, ensure_ascii=False)}
-
-입력 실패 이유:
-{reason}
-
-규칙:
-- 반드시 목록 중 하나만 선택
-- 출력은 JSON만
-형식:
-{{"cause":"...", "confidence":0.0}}
-confidence는 0~1 (확신이 낮으면 0.4~0.6)
-""".strip()
-
-    resp = client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": "Return valid JSON only."},
-            {"role": "user", "content": prompt},
-        ],
-        temperature=0.2,
-    )
-    text = resp.choices[0].message.content.strip()
-    try:
-        obj = json.loads(text)
-    except json.JSONDecodeError:
-        m = re.search(r"\{.*\}", text, flags=re.DOTALL)
-        if not m:
-            raise
-        obj = json.loads(m.group(0))
-
-    cause = str(obj.get("cause", "")).strip()
-    conf = float(obj.get("confidence", 0.5))
-    if cause not in cause_names:
-        cause = "기타(명확화 필요)" if "기타(명확화 필요)" in cause_names else cause_names[-1]
-        conf = min(conf, 0.55)
-    conf = max(0.0, min(1.0, conf))
-    return cause, conf, "ai"
-
-
-def classify_reason(reason: str, api_key: str, model: str) -> Tuple[str, float, str]:
-    causes_df = list_causes(active_only=True)
-    cause_names = causes_df["name"].tolist()
-
-    if not (reason or "").strip():
-        return ("기타(명확화 필요)" if "기타(명확화 필요)" in cause_names else cause_names[-1], 0.35, "rule")
-
-    # Prefer OpenAI if key exists
-    if api_key and api_key.strip():
-        try:
-            return openai_classify_reason(api_key, model, reason, cause_names)
-        except Exception:
-            # fall back
-            pass
-
-    return fallback_classify_reason(reason, causes_df)
-
-
-# -----------------------------
-# Repeated detection (>=14 days) by CAUSE (plan_id + cause_name)
-# -----------------------------
-def detect_repeated_causes_2w(failures_df: pd.DataFrame) -> Dict[Tuple[int, str], bool]:
-    if failures_df.empty:
-        return {}
-    df = failures_df.copy()
-    df["log_date"] = pd.to_datetime(df["log_date"]).dt.date
-    df["cause_name"] = df["cause_name"].fillna("기타(명확화 필요)")
-    flags: Dict[Tuple[int, str], bool] = {}
-    for (pid, cause), g in df.groupby(["plan_id", "cause_name"]):
-        dates = sorted(g["log_date"].tolist())
-        if len(dates) >= 2 and (dates[-1] - dates[0]).days >= 14:
-            flags[(int(pid), str(cause))] = True
-    return flags
-
-
-# -----------------------------
-# Coaching Engine
-# -----------------------------
-COACH_SCHEMA_HINT = """
-반드시 JSON만 출력해. (설명/마크다운 금지)
-형식:
-{
-  "top_causes": [
-    {
-      "cause": "원인 카테고리 이름(짧게)",
-      "summary": "왜 이게 공통 원인인지 2~3문장",
-      "actionable_advice": ["현실적 조언 1", "현실적 조언 2", "현실적 조언 3"],
-      "creative_advice_when_repeated_2w": ["(해당 원인이 2주 이상 반복된 항목이 있을 때만) 창의적 조언 1", "..."]
-    }
-  ],
-  "tone_note": "전체 톤이 비난 없이 코칭 중심인지 점검하는 한 문장"
-}
-규칙:
-- top_causes는 최대 3개
-- actionable_advice는 '지금 당장 실행' 가능한 수준(작고 구체적)으로
-- '비난/자책 유도' 표현 금지
-- 2주 이상 반복(repeated_2w=true)된 원인이 있으면, 해당 원인에 creative_advice_when_repeated_2w를 반드시 포함
-- 반복 원인이 없으면 creative_advice_when_repeated_2w는 빈 배열([])로
-"""
-
-
-def build_coach_prompt(items: List[Dict[str, Any]]) -> str:
-    return f"""
-너는 '실패 기록을 실행 전략으로 바꾸는' 코칭 AI야.
-사용자가 적은 "실패 이유"와 "원인 카테고리" 데이터를 보고 공통 원인을 최대 3가지로 묶고,
-각 원인에 대해 실행 가능하고 현실적인 개선 조언을 제시해.
-추가 규칙: 만약 repeated_2w=true 인 원인(같은 원인이 2주 이상 반복)이 있다면,
-그 원인에 대해 기존 조언과 결이 다른 "창의적인 대안 조언"도 제시해.
-톤은 절대 비난하지 말고, 코칭/격려 중심으로.
-
-입력 데이터:
-{json.dumps(items, ensure_ascii=False, indent=2)}
-
-{COACH_SCHEMA_HINT}
-""".strip()
-
-
-def openai_coach(api_key: str, model: str, items: List[Dict[str, Any]]) -> Dict[str, Any]:
-    client = get_openai_client(api_key)
-    resp = client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": "You are a supportive coaching assistant. Output must be valid JSON only."},
-            {"role": "user", "content": build_coach_prompt(items)},
-        ],
-        temperature=0.7,
-    )
-    text = resp.choices[0].message.content.strip()
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        m = re.search(r"\{.*\}", text, flags=re.DOTALL)
-        if not m:
-            raise
-        return json.loads(m.group(0))
-
-
-def fallback_coach(items: List[Dict[str, Any]]) -> Dict[str, Any]:
-    if not items:
-        return {"top_causes": [], "tone_note": "기록이 비어 있어 분석 대신 다음 기록을 기다리고 있어요."}
-
-    df = pd.DataFrame(items)
-    counts = df["cause"].value_counts().head(3)
-
-    top_causes = []
-    for cause, _cnt in counts.items():
-        sub = df[df["cause"] == cause]
-        repeated = bool(sub["repeated_2w"].fillna(False).any())
-
-        actionable = [
-            "실패가 난 날의 '첫 장애물'만 한 문장으로 적고, 내일은 그 장애물을 피하는 장치를 딱 1개만 추가해요(예: 회의 후 10분 휴식 고정).",
-            "계획을 '시작 2분 버전'으로 축소해서 진입장벽을 낮춰요(예: 운동 20분 → 스트레칭 2분만).",
-            "실패가 많이 나는 시간대를 파악해서, 그 시간엔 방해요인을 미리 치우는 루틴(알림 끄기/장소 이동/도구 미리 준비)을 만들어요.",
-        ]
-        creative = []
-        if repeated:
-            creative = [
-                "2주 이상 반복이면, 목표를 '성과'가 아니라 '조건 실험'으로 바꿔요. 예: '운동 성공' → '운동이 되는 조건 찾기'를 1주일만 실험.",
-                "트리거를 완전히 바꿔봐요. 시간(저녁→아침), 장소(집→카페/헬스장), 방식(혼자→동료/클래스) 중 하나만 교체해요.",
-            ]
-
-        top_causes.append(
-            {
-                "cause": cause,
-                "summary": f"최근 기록에서 '{cause}' 유형이 자주 등장해요. 이건 의지 문제가 아니라 '조건/설계' 조정으로 개선될 가능성이 큰 신호예요.",
-                "actionable_advice": actionable,
-                "creative_advice_when_repeated_2w": creative if repeated else [],
-            }
-        )
-
-    return {"top_causes": top_causes, "tone_note": "실패를 탓이 아니라 '조정 가능한 조건 데이터'로 다루는 톤을 유지했어요."}
-
-
-def run_coaching(api_key: str, model: str, items: List[Dict[str, Any]]) -> Tuple[Dict[str, Any], str]:
-    # If key exists, try OpenAI, else fallback
-    if api_key and api_key.strip():
-        try:
-            return openai_coach(api_key, model, items), "OpenAI"
-        except Exception as e:
-            # Show a gentle hint in UI; still return fallback
-            st.warning(f"OpenAI 호출에 실패해서 로컬 코칭으로 대체했어요. (원인: {type(e).__name__})")
-            return fallback_coach(items), "Local"
-    return fallback_coach(items), "Local"
-
-
-# -----------------------------
-# Reminder: in-app + .ics
-# -----------------------------
+# =========================
+# 앱 내부 리마인더
+# =========================
 def parse_hhmm(s: str) -> time:
     s = (s or "").strip()
     m = re.match(r"^(\d{1,2}):(\d{2})$", s)
@@ -678,546 +384,658 @@ def parse_hhmm(s: str) -> time:
     return time(hh, mm)
 
 
-def should_show_reminder(now_dt: datetime, reminder_t: time, window_min: int) -> bool:
-    target = datetime.combine(now_dt.date(), reminder_t)
-    delta = abs((now_dt - target).total_seconds()) / 60.0
-    return delta <= float(window_min)
+def should_remind(now_dt: datetime, remind_t: time, window_min: int) -> bool:
+    target = datetime.combine(now_dt.date(), remind_t)
+    delta_min = abs((now_dt - target).total_seconds()) / 60.0
+    return delta_min <= float(window_min)
 
 
-def count_pending_today(d: date) -> int:
-    ensure_daily_rows(d)
-    conn = get_conn()
-    cur = conn.cursor()
+def count_today_todos() -> int:
+    today = date.today().isoformat()
+    c = conn()
+    cur = c.cursor()
     row = cur.execute(
-        """
-        SELECT COUNT(*) FROM daily_logs dl
-        JOIN plans p ON p.id=dl.plan_id
-        WHERE dl.log_date=? AND p.active=1 AND dl.status='pending'
-        """,
-        (d.isoformat(),),
+        "SELECT COUNT(*) FROM tasks WHERE task_date=? AND status='todo'",
+        (today,),
     ).fetchone()
-    conn.close()
+    c.close()
     return int(row[0] if row else 0)
 
 
-def build_daily_ics(reminder_t: time) -> str:
-    dtstamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-    start = datetime.combine(today_local(), reminder_t).strftime("%Y%m%dT%H%M%S")
-    uid = f"failog-reminder-{dtstamp}@local"
-    return f"""BEGIN:VCALENDAR
-VERSION:2.0
-PRODID:-//failog//Reminder//EN
-CALSCALE:GREGORIAN
-BEGIN:VEVENT
-UID:{uid}
-DTSTAMP:{dtstamp}
-DTSTART:{start}
-DURATION:PT10M
-RRULE:FREQ=DAILY
-SUMMARY:failog 데일리 체크 리마인더
-DESCRIPTION:오늘의 계획을 성공/실패로 체크하고, 실패라면 이유를 한 문장 기록해요.
-END:VEVENT
-END:VCALENDAR
+# =========================
+# OpenAI 키(하단 입력)
+# =========================
+def effective_openai_key() -> str:
+    # 세션 우선, 없으면 DB 저장 키 사용
+    sk = st.session_state.get("openai_api_key", "")
+    if sk.strip():
+        return sk.strip()
+    return get_setting("openai_api_key", "").strip()
+
+
+def openai_client(api_key: str):
+    if OpenAI is None:
+        raise RuntimeError("openai 패키지가 설치되지 않았어요. pip install openai")
+    if not api_key.strip():
+        raise RuntimeError("OpenAI API Key가 비어 있어요.")
+    return OpenAI(api_key=api_key.strip())
+
+
+# =========================
+# 반복(2주+) 감지: 실패 원인 텍스트 기준
+# =========================
+def normalize_reason(text: str) -> str:
+    t = (text or "").strip().lower()
+    t = re.sub(r"\s+", " ", t)
+    t = re.sub(r"[^\w\s가-힣]", "", t)
+    return t
+
+
+def repeated_reason_flags(df_fail: pd.DataFrame) -> Dict[str, bool]:
+    if df_fail.empty:
+        return {}
+    x = df_fail.copy()
+    x["task_date"] = pd.to_datetime(x["task_date"]).dt.date
+    x["rnorm"] = x["fail_reason"].fillna("").map(normalize_reason)
+
+    flags: Dict[str, bool] = {}
+    for rnorm, g in x.groupby("rnorm"):
+        if not rnorm:
+            continue
+        dates = sorted(g["task_date"].tolist())
+        if len(dates) >= 2 and (dates[-1] - dates[0]).days >= 14:
+            flags[rnorm] = True
+    return flags
+
+
+# =========================
+# LLM: 주간 분석 / 전체 코칭 / 챗봇
+# =========================
+BASE_COACH_PROMPT = (
+    "사용자의 계획 실패 이유 목록을 분석해 공통 원인을 3가지 이내로 분류하고, "
+    "각 원인에 대해 실행 가능하고 현실적인 개선 조언을 제시해줘. "
+    "앞에서 했던 실패가 2주 이상 반복된다면 창의적인 다른 조언을 제시해. "
+    "톤은 비난 없이 코칭 중심으로 작성해."
+)
+
+COACH_SCHEMA = """
+반드시 JSON만 출력해. (설명/마크다운 금지)
+형식:
+{
+  "top_causes":[
+    {
+      "cause":"원인 카테고리(짧게)",
+      "summary":"2~3문장 설명",
+      "actionable_advice":["실행 조언1","실행 조언2","실행 조언3"],
+      "creative_advice_when_repeated_2w":["(반복이면)창의 조언1","..."]
+    }
+  ]
+}
+규칙:
+- top_causes 최대 3개
+- actionable_advice는 작고 구체적으로
+- 비난/자책 유도 금지
+- repeated_2w=true 항목이 있으면 해당 원인에 creative_advice_when_repeated_2w 포함
+- 반복 없으면 creative_advice_when_repeated_2w는 []
 """
 
 
-# -----------------------------
-# Sidebar: OpenAI Key UI
-# -----------------------------
-def sidebar_openai_panel():
-    st.sidebar.header("🔑 OpenAI 설정")
+def llm_weekly_reason_analysis(api_key: str, model: str, reasons: List[str]) -> Dict[str, Any]:
+    client = openai_client(api_key)
+    prompt = f"""
+너는 사용자의 실패 이유를 읽고, 주간 기준으로 공통 원인을 최대 3개로 묶어 요약해.
+입력은 사용자가 직접 쓴 실패 이유 목록이야.
 
-    # Load defaults from DB (optional) for convenience
-    db_model = get_setting("openai_model", "gpt-4o-mini")
-    db_key = get_setting("openai_api_key", "")
+실패 이유 목록:
+{json.dumps(reasons, ensure_ascii=False)}
 
-    if "openai_api_key" not in st.session_state:
-        st.session_state["openai_api_key"] = ""  # default empty
+출력은 JSON만.
+형식:
+{{
+  "groups":[
+    {{"cause":"원인","description":"요약 1~2문장","examples":["예시1","예시2"],"estimated_count": 0}}
+  ]
+}}
+규칙:
+- groups 최대 3개
+- examples는 원문을 짧게(각 1줄)
+- estimated_count는 대략적인 개수(정수)
+""".strip()
 
-    # input
-    api_key = st.sidebar.text_input(
-        "OpenAI API Key",
-        value=st.session_state["openai_api_key"],
-        type="password",
-        placeholder="sk-...",
-        help="기본적으로 세션에만 저장돼요(브라우저 닫으면 사라짐).",
+    resp = client.chat.completions.create(
+        model=model,
+        messages=[{"role": "system", "content": "Return valid JSON only."}, {"role": "user", "content": prompt}],
+        temperature=0.4,
     )
-    st.session_state["openai_api_key"] = api_key
-
-    model = st.sidebar.text_input("모델", value=db_model, help="예: gpt-4o-mini / gpt-4.1-mini 등")
-    st.sidebar.caption("키가 비어 있으면 로컬(규칙 기반)로 동작합니다.")
-
-    # optional persistence
-    persist = st.sidebar.toggle("키를 로컬(DB)에 저장", value=False, help="공용 PC에서는 비추천")
-    if st.sidebar.button("설정 저장", use_container_width=True):
-        upsert_setting("openai_model", model.strip() or "gpt-4o-mini")
-        if persist:
-            upsert_setting("openai_api_key", api_key.strip())
-            st.sidebar.success("모델/키를 저장했어요.")
-        else:
-            upsert_setting("openai_api_key", "")
-            st.sidebar.success("모델만 저장했고, 키는 세션에만 남겨두었어요.")
-
-    # If user previously stored key in DB and wants to use it:
-    use_db_key = st.sidebar.toggle("저장된 키 사용", value=False, help="DB에 저장된 키가 있을 때만 의미 있어요.")
-    effective_key = api_key.strip()
-    if use_db_key and db_key.strip():
-        effective_key = db_key.strip()
-
-    return effective_key, (model.strip() or "gpt-4o-mini")
+    text = (resp.choices[0].message.content or "").strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        m = re.search(r"\{.*\}", text, flags=re.DOTALL)
+        return json.loads(m.group(0)) if m else {"groups": []}
 
 
-# -----------------------------
-# Main App
-# -----------------------------
-def main():
-    st.set_page_config(page_title="failog", page_icon="🧭", layout="wide")
-    init_db()
+def llm_overall_coaching(api_key: str, model: str, fail_items: List[Dict[str, Any]]) -> Dict[str, Any]:
+    client = openai_client(api_key)
+    prompt = f"""
+{BASE_COACH_PROMPT}
 
-    # Sidebar OpenAI
-    effective_api_key, openai_model = sidebar_openai_panel()
+입력 데이터(최근 실패 기록):
+{json.dumps(fail_items, ensure_ascii=False, indent=2)}
 
-    # Reminder settings
-    reminder_enabled = get_setting("reminder_enabled", "true").lower() == "true"
-    reminder_time = parse_hhmm(get_setting("reminder_time", "21:30"))
-    reminder_window = int(get_setting("reminder_window_min", "15"))
-    poll_sec = int(get_setting("reminder_poll_sec", "60"))
+{COACH_SCHEMA}
+""".strip()
 
-    if reminder_enabled and st_autorefresh is not None:
-        st_autorefresh(interval=poll_sec * 1000, key="reminder_refresh")
-
-    # In-app reminder banner
-    if reminder_enabled:
-        pending = count_pending_today(today_local())
-        if pending > 0 and should_show_reminder(datetime.now(), reminder_time, reminder_window):
-            st.toast(f"리마인더: 아직 체크하지 않은 항목이 {pending}개 있어요. (가볍게 체크만 해도 충분해요)", icon="⏰")
-            st.info(f"⏰ 오늘 체크가 아직 {pending}개 남아 있어요. 실패여도 괜찮아요. 한 문장만 남기면 내일이 쉬워져요.")
-
-    st.title(APP_TITLE)
-    st.caption("실패는 ‘탓’이 아니라 ‘조건 데이터’예요. 비난 없이 코칭으로 바꿔요.")
-
-    tab_daily, tab_report, tab_analysis, tab_manage = st.tabs(
-        ["✅ 데일리 체크", "🗓️ 주간 리포트", "📈 원인 트렌드 & 코칭", "⚙️ 관리(계획/원인/알림)"]
+    resp = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": "You are a supportive coaching assistant. Output must be valid JSON only."},
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0.7,
     )
+    text = (resp.choices[0].message.content or "").strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        m = re.search(r"\{.*\}", text, flags=re.DOTALL)
+        return json.loads(m.group(0)) if m else {"top_causes": []}
 
-    # -------------------------
-    # Tab 1: Daily
-    # -------------------------
-    with tab_daily:
-        colL, colR = st.columns([1, 2])
 
-        with colL:
-            selected_date = st.date_input("날짜", value=today_local(), key="daily_date")
-            ensure_daily_rows(selected_date)
-            st.subheader("오늘의 한 줄 코칭")
-            st.write("실패는 ‘내가 부족함’이 아니라, **조건이 안 맞았다는 신호**일 때가 많아요.")
+def llm_chat(api_key: str, model: str, system_context: str, msgs: List[Dict[str, str]]) -> str:
+    client = openai_client(api_key)
+    resp = client.chat.completions.create(
+        model=model,
+        messages=[{"role": "system", "content": system_context}] + msgs,
+        temperature=0.7,
+    )
+    return (resp.choices[0].message.content or "").strip()
 
-        with colR:
-            st.subheader("데일리 계획 리스트")
-            df = get_daily_logs(selected_date)
-            causes_df = list_causes(active_only=True)
-            cause_names = causes_df["name"].tolist()
 
-            if df.empty:
-                st.warning("활성화된 계획이 없어요. '관리'에서 계획을 추가해 주세요.")
-            else:
-                for _, row in df.iterrows():
-                    with st.container(border=True):
-                        c1, c2 = st.columns([4, 6])
-                        with c1:
-                            st.markdown(f"**{row['plan_title']}**")
-                            st.caption(f"상태: `{row['status']}`")
-                            if row.get("cause_name"):
-                                st.caption(
-                                    f"원인: {row['cause_name']} ({row.get('cause_source','')}, {row.get('cause_confidence',0):.2f})"
-                                )
+# =========================
+# 하단 OpenAI 설정 UI
+# =========================
+def render_openai_bottom_panel():
+    st.markdown("<hr/>", unsafe_allow_html=True)
+    st.markdown("### 🔑 OpenAI 설정")
 
-                        with c2:
-                            b1, b2, b3 = st.columns([1, 1, 1])
-                            with b1:
-                                if st.button("성공 ✅", key=f"succ_{row['id']}"):
-                                    update_log_success(int(row["id"]))
-                                    st.success("성공 체크 완료!")
-                                    st.rerun()
-                            with b2:
-                                if st.button("대기 ↩️", key=f"pend_{row['id']}"):
-                                    update_log_pending(int(row["id"]))
-                                    st.info("대기로 되돌렸어요.")
-                                    st.rerun()
-                            with b3:
-                                st.write("")
-
-                            reason_key = f"reason_{row['id']}"
-                            cause_key = f"cause_{row['id']}"
-
-                            default_reason = row["reason"] if row["reason"] else ""
-                            reason = st.text_input("실패 이유(한 문장)", value=default_reason, key=reason_key)
-
-                            default_cause = row["cause_name"] if row["cause_name"] in cause_names else "자동 분류"
-                            options = ["자동 분류"] + cause_names
-                            cause_sel = st.selectbox(
-                                "원인 카테고리",
-                                options=options,
-                                index=options.index(default_cause) if default_cause in options else 0,
-                                key=cause_key,
-                            )
-
-                            if st.button("실패 ❌ 저장", key=f"fail_save_{row['id']}"):
-                                if cause_sel == "자동 분류":
-                                    cause, conf, src = classify_reason(reason, effective_api_key, openai_model)
-                                else:
-                                    cause, conf, src = cause_sel, 1.0, "user"
-                                update_log_fail(int(row["id"]), reason, cause, src, conf)
-                                st.warning("실패 체크 저장 완료! 기록을 남긴 것 자체가 이미 다음 성공 확률을 올렸어요.")
-                                st.rerun()
-
-    # -------------------------
-    # Tab 2: Weekly Report
-    # -------------------------
-    with tab_report:
-        st.subheader("습관/목표별 주간 리포트")
-        end_d = st.date_input("리포트 종료일", value=today_local(), key="report_end")
-        ws = week_start(end_d)
-        we = ws + timedelta(days=6)
-        st.caption(f"주간 범위: {ws.isoformat()} ~ {we.isoformat()} (월~일)")
-
-        logs = get_logs_range(ws, we, active_only=False)
-        if logs.empty:
-            st.info("이 주차에는 기록이 없어요.")
-        else:
-            x = logs.copy()
-            x["is_success"] = (x["status"] == "success").astype(int)
-            x["is_fail"] = (x["status"] == "fail").astype(int)
-            x["is_pending"] = (x["status"] == "pending").astype(int)
-            summary = x.groupby(["plan_id", "plan_title"], as_index=False).agg(
-                success=("is_success", "sum"),
-                fail=("is_fail", "sum"),
-                pending=("is_pending", "sum"),
-            )
-            summary["checked"] = summary["success"] + summary["fail"]
-            summary["success_rate"] = summary.apply(lambda r: (r["success"] / r["checked"]) if r["checked"] else 0.0, axis=1)
-            summary_show = summary.sort_values(["success_rate", "checked"], ascending=[False, False]).copy()
-            summary_show["success_rate"] = (summary_show["success_rate"] * 100).round(1).astype(str) + "%"
-            st.dataframe(summary_show, use_container_width=True, hide_index=True)
-
-            st.markdown("### 계획별 상세")
-            failures = logs[logs["status"] == "fail"].copy()
-            failures["cause_name"] = failures["cause_name"].fillna("기타(명확화 필요)")
-            repeated_flags = detect_repeated_causes_2w(get_failures(ws - timedelta(days=21), we))
-
-            for _, row in summary.sort_values(["success_rate", "checked"], ascending=[False, False]).iterrows():
-                pid, title = int(row["plan_id"]), row["plan_title"]
-                with st.container(border=True):
-                    st.markdown(f"#### {title}")
-
-                    sub = logs[logs["plan_id"] == pid].copy()
-                    succ = int((sub["status"] == "success").sum())
-                    fail = int((sub["status"] == "fail").sum())
-                    pend = int((sub["status"] == "pending").sum())
-                    checked = succ + fail
-                    rate = (succ / checked) if checked else 0.0
-
-                    c1, c2, c3, c4 = st.columns(4)
-                    c1.metric("성공", succ)
-                    c2.metric("실패", fail)
-                    c3.metric("대기", pend)
-                    c4.metric("주간 성공률", f"{rate*100:.1f}%")
-
-                    fsub = failures[failures["plan_id"] == pid]
-                    if fsub.empty:
-                        st.success("이번 주에는 실패 기록이 없어요. 이 흐름을 가볍게 유지해요.")
-                    else:
-                        topc = fsub["cause_name"].value_counts().head(3)
-                        st.write("실패 Top 원인:")
-                        for cause, cnt in topc.items():
-                            rep = repeated_flags.get((pid, str(cause)), False)
-                            tag = " (2주+ 반복 신호)" if rep else ""
-                            st.write(f"- {cause}: {cnt}회{tag}")
-
-                        with st.expander("실패 기록(이유/원인) 보기", expanded=False):
-                            view = fsub[["log_date", "reason", "cause_name", "cause_source", "cause_confidence"]].copy()
-                            st.dataframe(view, use_container_width=True, hide_index=True)
-
-    # -------------------------
-    # Tab 3: Trends & Coaching
-    # -------------------------
-    with tab_analysis:
-        st.subheader("원인 카테고리 트렌드 & 코칭")
-        colA, colB, colC = st.columns([1, 1, 2])
-        with colA:
-            days = st.selectbox("분석 기간(일)", [7, 14, 21, 30, 60, 90], index=1, key="an_days")
-        with colB:
-            end_d = st.date_input("종료일", value=today_local(), key="an_end")
-        with colC:
-            st.caption("저장된 원인 카테고리를 기준으로 분포/트렌드를 그리고, 공통 원인 3개 이내 코칭을 생성해요.")
-            st.caption("같은 원인이 2주 이상 반복되면(원인 단위) 해당 원인에 창의적 대안을 추가합니다.")
-
-        start_d = end_d - timedelta(days=int(days) - 1)
-        failures_df = get_failures(start_d, end_d)
-
-        st.markdown("#### 원인 저장 상태")
-        missing = int(failures_df["cause_name"].isna().sum()) if not failures_df.empty else 0
-        st.write(f"- 이 기간 실패 중 원인 미저장: **{missing}건**")
-        backfill = st.checkbox("이 기간의 원인 미저장 실패를 자동 분류해서 DB에 저장(추천)", value=False)
-
-        if backfill and missing > 0:
-            for _, r in failures_df[failures_df["cause_name"].isna()].iterrows():
-                cid = int(r["id"])
-                reason = r["reason"] or ""
-                cause, conf, src = classify_reason(reason, effective_api_key, openai_model)
-                conn = get_conn()
-                conn.execute(
-                    """
-                    UPDATE daily_logs
-                    SET cause_name=?, cause_source=?, cause_confidence=?, cause_updated_at=?, updated_at=?
-                    WHERE id=?
-                    """,
-                    (cause, src, float(conf), now_iso(), now_iso(), cid),
-                )
-                conn.commit()
-                conn.close()
-            st.success("자동 분류 저장 완료! (다음 분석이 더 정확해져요)")
-            failures_df = get_failures(start_d, end_d)
-
-        if failures_df.empty:
-            st.info("이 기간엔 실패 기록이 없어요. 👍 지금의 리듬을 유지해도 충분히 좋습니다.")
-        else:
-            failures_df = failures_df.copy()
-            failures_df["cause_name"] = failures_df["cause_name"].fillna("기타(명확화 필요)")
-            failures_df["log_date"] = pd.to_datetime(failures_df["log_date"]).dt.date
-
-            st.markdown("#### 원인 분포")
-            dist = failures_df["cause_name"].value_counts().reset_index()
-            dist.columns = ["cause", "count"]
-            st.dataframe(dist, use_container_width=True, hide_index=True)
-            st.bar_chart(dist.set_index("cause"))
-
-            st.markdown("#### 원인 트렌드(주차별)")
-            tmp = failures_df.copy()
-            tmp["week"] = tmp["log_date"].apply(lambda d: week_start(d).isoformat())
-            trend = tmp.groupby(["week", "cause_name"]).size().reset_index(name="count")
-            pivot = trend.pivot(index="week", columns="cause_name", values="count").fillna(0).sort_index()
-            st.line_chart(pivot)
-
-            repeated_flags = detect_repeated_causes_2w(failures_df)
-
-            items = []
-            for _, r in failures_df.iterrows():
-                pid = int(r["plan_id"])
-                cause = str(r["cause_name"])
-                items.append(
-                    {
-                        "plan_title": r["plan_title"],
-                        "date": str(r["log_date"]),
-                        "reason": r["reason"] or "",
-                        "cause": cause,
-                        "repeated_2w": bool(repeated_flags.get((pid, cause), False)),
-                    }
-                )
-
-            st.markdown("#### 코칭 생성")
-            run_btn = st.button("코칭 생성/갱신", type="primary", key="coach_run")
-
-            if run_btn or ("coach_result" not in st.session_state):
-                result, engine = run_coaching(effective_api_key, openai_model, items)
-                st.session_state["coach_result"] = result
-                st.session_state["coach_engine"] = engine
-
-            result = st.session_state.get("coach_result", {})
-            engine = st.session_state.get("coach_engine", "Local")
-            st.write(f"사용 엔진: **{engine}**  |  모델: **{openai_model}**")
-
-            top_causes = result.get("top_causes", []) if isinstance(result.get("top_causes", []), list) else []
-            if not top_causes:
-                st.info("아직 분류할 만큼 데이터가 부족해요. 실패 이유를 한 문장이라도 더 쌓아보면 정확도가 올라가요.")
-            else:
-                st.markdown("### 공통 원인 TOP (최대 3)")
-                for i, c in enumerate(top_causes, start=1):
-                    with st.container(border=True):
-                        st.markdown(f"### {i}) {c.get('cause','(원인)')}")
-                        st.write(c.get("summary", ""))
-
-                        st.markdown("**실행 가능한 개선 조언(현실 버전)**")
-                        for tip in (c.get("actionable_advice") or [])[:6]:
-                            st.write(f"- {tip}")
-
-                        creative = c.get("creative_advice_when_repeated_2w") or []
-                        if creative:
-                            st.markdown("**2주 이상 반복 시: 완전히 다른 각도의 대안(창의 버전)**")
-                            for tip in creative[:6]:
-                                st.write(f"- {tip}")
-
-                st.caption(result.get("tone_note", ""))
-
-            with st.expander("🔎 이번 분석에 사용된 데이터 보기", expanded=False):
-                st.dataframe(pd.DataFrame(items), use_container_width=True, hide_index=True)
-
-    # -------------------------
-    # Tab 4: Manage
-    # -------------------------
-    with tab_manage:
-        st.subheader("관리")
-        subtab_plans, subtab_causes, subtab_reminder, subtab_fix = st.tabs(
-            ["계획", "원인 카테고리", "알림(리마인더)", "데이터 정리/수정"]
+    col1, col2, col3 = st.columns([3.2, 1.6, 1.4])
+    with col1:
+        api_key = st.text_input(
+            "OpenAI API Key",
+            value=st.session_state.get("openai_api_key", ""),
+            type="password",
+            placeholder="sk-...",
         )
+    with col2:
+        model = st.text_input("모델", value=get_setting("openai_model", "gpt-4o-mini"))
+    with col3:
+        save = st.toggle("로컬 저장", value=False, help="공용 PC면 끄는 걸 추천")
 
-        with subtab_plans:
-            col1, col2 = st.columns([2, 3])
-            with col1:
-                st.markdown("#### 새 계획 추가")
-                new_title = st.text_input("계획/습관 이름", placeholder="예: 영어 단어 20개 / 운동 20분", key="new_plan")
-                if st.button("추가", key="add_plan_btn"):
-                    if not new_title.strip():
-                        st.error("계획 이름을 입력해 주세요.")
-                    else:
-                        add_plan(new_title.strip())
-                        st.success("추가 완료!")
-                        st.rerun()
+    b1, b2 = st.columns([1, 4])
+    with b1:
+        if st.button("적용", use_container_width=True):
+            st.session_state["openai_api_key"] = api_key.strip()
+            set_setting("openai_model", (model.strip() or "gpt-4o-mini"))
+            if save:
+                set_setting("openai_api_key", api_key.strip())
+            st.success("적용됐어요.")
+    with b2:
+        st.caption("키가 없으면 실패 분석/코칭/챗봇이 동작하지 않아요.")
 
-            with col2:
-                st.markdown("#### 내 계획 목록")
-                plans_df = list_plans(active_only=False)
-                if plans_df.empty:
-                    st.info("아직 계획이 없어요. 왼쪽에서 추가해 주세요.")
+
+# =========================
+# 화면 1: 플래너
+# =========================
+def screen_planner():
+    st.markdown("## 📅 플래너")
+    st.markdown("<div class='small'>Month는 전체 흐름, 아래는 <b>현재 주</b>를 크게 보여줘요.</div>", unsafe_allow_html=True)
+
+    # state
+    if "selected_date" not in st.session_state:
+        st.session_state["selected_date"] = date.today()
+
+    selected = st.session_state["selected_date"]
+    ws = week_start(selected)
+
+    # 습관 자동 생성
+    ensure_week_habit_tasks(ws)
+
+    # reminder
+    if get_setting("reminder_enabled", "true").lower() == "true":
+        rt = parse_hhmm(get_setting("reminder_time", "21:30"))
+        win = int(get_setting("reminder_window_min", "15"))
+        if should_remind(datetime.now(), rt, win):
+            todos = count_today_todos()
+            if todos > 0:
+                st.toast(f"⏰ 아직 체크하지 않은 항목이 {todos}개 있어요", icon="⏰")
+                st.info("오늘은 ‘완벽’ 말고 ‘체크’만 해도 충분해요. 실패여도 한 문장 남기면 내일이 쉬워져요.")
+
+    left, right = st.columns([1.05, 1.95], gap="large")
+
+    # ---- Month (compact)
+    with left:
+        st.markdown("<div class='card'>", unsafe_allow_html=True)
+        st.markdown("### Month")
+
+        y, m = selected.year, selected.month
+        nav = st.columns([1, 2, 1])
+        with nav[0]:
+            if st.button("◀", use_container_width=True):
+                if m == 1:
+                    y -= 1
+                    m = 12
                 else:
-                    for _, r in plans_df.iterrows():
-                        with st.container(border=True):
-                            a, b, c = st.columns([4, 2, 2])
-                            with a:
-                                st.markdown(f"**{r['title']}**")
-                                st.caption(f"생성: {r['created_at']}")
-                            with b:
-                                active = bool(r["active"])
-                                st.write("상태:", "활성 ✅" if active else "비활성 ⛔")
-                            with c:
-                                if active:
-                                    if st.button("비활성화", key=f"deact_{r['id']}"):
-                                        set_plan_active(int(r["id"]), False)
-                                        st.rerun()
-                                else:
-                                    if st.button("활성화", key=f"act_{r['id']}"):
-                                        set_plan_active(int(r["id"]), True)
-                                        st.rerun()
-
-        with subtab_causes:
-            st.markdown("#### 원인 카테고리 목록(분류 기준)")
-            causes_df = list_causes(active_only=False)
-            for _, r in causes_df.iterrows():
-                with st.container(border=True):
-                    c1, c2, c3 = st.columns([3, 5, 2])
-                    with c1:
-                        st.markdown(f"**{r['name']}**")
-                        st.caption("활성 ✅" if int(r["active"]) == 1 else "비활성 ⛔")
-                    with c2:
-                        st.write(r["description"] or "")
-                        try:
-                            kws = json.loads(r["keywords"] or "[]")
-                        except Exception:
-                            kws = []
-                        if kws:
-                            st.caption("키워드: " + ", ".join(kws))
-                    with c3:
-                        if int(r["active"]) == 1:
-                            if st.button("비활성화", key=f"cause_off_{r['id']}"):
-                                set_cause_active(int(r["id"]), False)
-                                st.rerun()
-                        else:
-                            if st.button("활성화", key=f"cause_on_{r['id']}"):
-                                set_cause_active(int(r["id"]), True)
-                                st.rerun()
-
-            st.markdown("---")
-            st.markdown("#### 새 원인 카테고리 추가")
-            name = st.text_input("이름", placeholder="예: 장소/도구 문제", key="cause_new_name")
-            desc = st.text_area("설명", placeholder="이 카테고리가 포함하는 실패의 공통 특징", key="cause_new_desc")
-            kws_raw = st.text_input("키워드(쉼표로 구분)", placeholder="예: 장소, 카페, 노트북, 준비물", key="cause_new_kws")
-            if st.button("원인 추가", key="cause_add_btn"):
-                if not name.strip():
-                    st.error("이름은 필수예요.")
+                    m -= 1
+                st.session_state["selected_date"] = date(y, m, 1)
+                st.rerun()
+        with nav[1]:
+            st.markdown(f"<div style='text-align:center; font-weight:650; font-size:1.05rem;'>{y}.{m:02d}</div>", unsafe_allow_html=True)
+        with nav[2]:
+            if st.button("▶", use_container_width=True):
+                if m == 12:
+                    y += 1
+                    m = 1
                 else:
-                    kws = [x.strip() for x in kws_raw.split(",") if x.strip()]
-                    try:
-                        add_cause(name, desc, kws)
-                        st.success("추가 완료!")
-                        st.rerun()
-                    except sqlite3.IntegrityError:
-                        st.error("이미 같은 이름의 원인이 있어요. 이름을 바꿔주세요.")
-
-        with subtab_reminder:
-            st.markdown("#### 리마인더 설정")
-            enabled = st.toggle("리마인더 켜기", value=reminder_enabled, key="rem_en")
-            rt = st.text_input("리마인더 시간(HH:MM)", value=get_setting("reminder_time", "21:30"), key="rem_time")
-            wm = st.number_input("표시 허용 오차(분)", min_value=1, max_value=120,
-                                 value=int(get_setting("reminder_window_min", "15")), key="rem_win")
-            ps = st.number_input("앱 내 체크 주기(초)", min_value=10, max_value=600,
-                                 value=int(get_setting("reminder_poll_sec", "60")), key="rem_poll")
-
-            if st.button("설정 저장", key="rem_save"):
-                upsert_setting("reminder_enabled", "true" if enabled else "false")
-                upsert_setting("reminder_time", rt.strip())
-                upsert_setting("reminder_window_min", str(int(wm)))
-                upsert_setting("reminder_poll_sec", str(int(ps)))
-                st.success("저장했어요. (앱이 켜져 있을 때 설정 시간에 배너가 떠요)")
+                    m += 1
+                st.session_state["selected_date"] = date(y, m, 1)
                 st.rerun()
 
-            st.markdown("---")
-            st.markdown("#### 캘린더로 리마인더 받기(.ics)")
-            t = parse_hhmm(rt)
-            ics = build_daily_ics(t)
-            st.download_button(
-                "📥 매일 리마인더 .ics 다운로드",
-                data=ics.encode("utf-8"),
-                file_name="failog_daily_reminder.ics",
-                mime="text/calendar",
-            )
-            st.caption("다운로드 후 캘린더에 가져오기(import) 하면, 앱을 안 켜도 OS/캘린더 알림을 받을 수 있어요.")
+        st.markdown(
+            "<div style='display:grid; grid-template-columns: repeat(7, 1fr); gap:6px; font-size:0.82rem; opacity:0.7; margin-top:8px;'>"
+            + "".join([f"<div style='text-align:center;'>{k}</div>" for k in ["월", "화", "수", "목", "금", "토", "일"]])
+            + "</div>",
+            unsafe_allow_html=True,
+        )
 
-        with subtab_fix:
-            st.markdown("#### 실패 기록의 원인 수정(정확도 개선)")
-            d1 = st.date_input("시작일", value=today_local() - timedelta(days=14), key="fix_s")
-            d2 = st.date_input("종료일", value=today_local(), key="fix_e")
-            df = get_failures(d1, d2)
-            if df.empty:
-                st.info("선택한 기간에 실패 기록이 없어요.")
-            else:
-                df = df.copy()
-                df["cause_name"] = df["cause_name"].fillna("기타(명확화 필요)")
-                st.dataframe(
-                    df[["id", "log_date", "plan_title", "reason", "cause_name", "cause_source", "cause_confidence"]],
-                    use_container_width=True,
-                    hide_index=True,
-                )
+        grid = month_grid(y, m)
+        today = date.today()
+        for row in grid:
+            cols = st.columns(7, gap="small")
+            for i, d in enumerate(row):
+                if d is None:
+                    cols[i].markdown("<div style='height:32px;'></div>", unsafe_allow_html=True)
+                    continue
 
-                st.markdown("원인 수정:")
-                causes_df = list_causes(active_only=True)
-                cause_names = causes_df["name"].tolist()
+                label = f"{d.day}"
+                if d == today:
+                    label = f"•{d.day}"
 
-                target_id = st.number_input(
-                    "수정할 log id",
-                    min_value=int(df["id"].min()),
-                    max_value=int(df["id"].max()),
-                    value=int(df["id"].min()),
-                    step=1,
-                )
-                new_cause = st.selectbox("새 원인", options=cause_names, index=0)
-
-                if st.button("원인 업데이트", key="fix_update"):
-                    conn = get_conn()
-                    conn.execute(
-                        """
-                        UPDATE daily_logs
-                        SET cause_name=?, cause_source='user', cause_confidence=1.0, cause_updated_at=?, updated_at=?
-                        WHERE id=?
-                        """,
-                        (new_cause, now_iso(), now_iso(), int(target_id)),
-                    )
-                    conn.commit()
-                    conn.close()
-                    st.success("업데이트 완료! 다음 분석부터 더 정확해져요.")
+                if cols[i].button(label, key=f"cal_{d.isoformat()}", use_container_width=True):
+                    st.session_state["selected_date"] = d
                     st.rerun()
 
-    st.markdown("---")
-    st.caption(f"© failog • Timezone hint: {DEFAULT_TZ} • DB: {DB_PATH}")
+        st.markdown("</div>", unsafe_allow_html=True)
+
+        # ---- Simple reminder settings (kept minimal; still 2 screens)
+        with st.expander("알림 설정", expanded=False):
+            en = st.toggle("리마인더 켜기", value=get_setting("reminder_enabled", "true").lower() == "true")
+            t = st.text_input("시간(HH:MM)", value=get_setting("reminder_time", "21:30"))
+            w = st.number_input("허용 오차(분)", min_value=1, max_value=120, value=int(get_setting("reminder_window_min", "15")))
+            if st.button("저장", use_container_width=True):
+                set_setting("reminder_enabled", "true" if en else "false")
+                set_setting("reminder_time", (t or "21:30"))
+                set_setting("reminder_window_min", str(int(w)))
+                st.success("저장됐어요.")
+
+    # ---- Current Week (main)
+    with right:
+        st.markdown("<div class='card'>", unsafe_allow_html=True)
+        st.markdown("### Current Week")
+        st.markdown(
+            f"<span class='pill pill-strong'>주간</span><span class='pill pill-weak'>{ws.isoformat()} ~ {(ws+timedelta(days=6)).isoformat()}</span>",
+            unsafe_allow_html=True,
+        )
+        st.write("")
+
+        wcols = st.columns(7, gap="small")
+        days = week_days(ws)
+        for i, d in enumerate(days):
+            label = f"{korean_dow(i)}\n{d.day}"
+            if wcols[i].button(label, key=f"w_{d.isoformat()}", use_container_width=True):
+                st.session_state["selected_date"] = d
+                st.rerun()
+            if d == selected:
+                wcols[i].caption("선택")
+
+        st.markdown("<hr/>", unsafe_allow_html=True)
+        st.markdown(f"#### {selected.isoformat()} ({korean_dow(selected.weekday())})")
+
+        # ---- Add plan (1-time)
+        c1, c2 = st.columns([4, 1])
+        with c1:
+            new_plan = st.text_input("계획 추가(1회성)", placeholder="예: 독서 10분 / 이메일 정리", key="new_plan_text")
+        with c2:
+            if st.button("추가", use_container_width=True):
+                add_plan_task(selected, new_plan)
+                st.session_state["new_plan_text"] = ""
+                st.rerun()
+
+        # ---- Add habit (minimal)
+        with st.expander("습관 추가(반복)", expanded=False):
+            hc1, hc2 = st.columns([3, 2])
+            with hc1:
+                habit_title = st.text_input("습관 이름", placeholder="예: 운동 10분", key="habit_title")
+            with hc2:
+                dow_labels = [f"{korean_dow(i)}" for i in range(7)]
+                picked = st.multiselect("반복 요일", options=list(range(7)), format_func=lambda x: dow_labels[x], default=[0, 1, 2, 3, 4])
+            if st.button("습관 저장", use_container_width=True):
+                add_habit(habit_title, picked)
+                st.session_state["habit_title"] = ""
+                ensure_week_habit_tasks(ws)
+                st.success("습관을 저장했어요. 이번 주부터 자동으로 체크리스트에 떠요.")
+                st.rerun()
+
+            # show active habits compact
+            hdf = list_habits(active_only=False)
+            if not hdf.empty:
+                st.markdown("<div class='small'>현재 습관</div>", unsafe_allow_html=True)
+                for _, h in hdf.iterrows():
+                    mask = str(h["dow_mask"])
+                    days_txt = "".join([korean_dow(i) if mask[i] == "1" else "" for i in range(7)])
+                    a, b = st.columns([5, 1])
+                    with a:
+                        st.write(f"• {h['title']}  ·  {days_txt if days_txt else '—'}")
+                    with b:
+                        active = int(h["active"]) == 1
+                        if st.button("ON" if active else "OFF", key=f"hab_{h['id']}", use_container_width=True):
+                            set_habit_active(int(h["id"]), not active)
+                            ensure_week_habit_tasks(ws)
+                            st.rerun()
+
+        # ---- Task list
+        df = list_tasks_for_date(selected)
+        if df.empty:
+            st.markdown("<div class='small'>아직 항목이 없어요. 계획을 하나 추가하거나 습관을 만들어보세요.</div>", unsafe_allow_html=True)
+        else:
+            for _, r in df.iterrows():
+                tid = int(r["id"])
+                src = r["source"]  # plan/habit
+                status = r["status"]
+                text = r["text"]
+                reason = r["fail_reason"] or ""
+
+                icon_src = "🔁" if src == "habit" else "📝"
+                icon_status = {"todo": "⏳", "success": "✅", "fail": "❌"}.get(status, "⏳")
+
+                st.markdown("<div class='task'>", unsafe_allow_html=True)
+                top = st.columns([6, 1.2, 1.2], gap="small")
+
+                with top[0]:
+                    st.markdown(f"**{icon_status} {text}**  <span class='pill pill-weak'>{icon_src}</span>", unsafe_allow_html=True)
+                    if status == "fail":
+                        st.caption(f"실패 원인: {reason}")
+
+                with top[1]:
+                    if st.button("성공", key=f"s_{tid}", use_container_width=True):
+                        update_task_status(tid, "success")
+                        st.session_state.pop(f"show_fail_{tid}", None)
+                        st.rerun()
+
+                with top[2]:
+                    if st.button("실패", key=f"f_{tid}", use_container_width=True):
+                        st.session_state[f"show_fail_{tid}"] = True
+
+                # fail editor
+                if st.session_state.get(f"show_fail_{tid}", False):
+                    reason_in = st.text_input("실패 원인(한 문장)", value=reason, key=f"r_{tid}")
+                    a, b = st.columns([1, 4])
+                    with a:
+                        if st.button("저장", key=f"save_fail_{tid}", use_container_width=True):
+                            update_task_fail(tid, reason_in)
+                            st.session_state[f"show_fail_{tid}"] = False
+                            st.rerun()
+                    with b:
+                        st.caption("짧아도 좋아요. ‘무슨 조건 때문에’가 핵심이에요.")
+                st.markdown("</div>", unsafe_allow_html=True)
+
+
+# =========================
+# 화면 2: 실패 화면
+# =========================
+def screen_failures():
+    st.markdown("## ⚠️ 실패")
+    st.markdown("<div class='small'>이번 주를 중심으로, <b>&lt;</b> 버튼으로 이전 주 기록을 볼 수 있어요.</div>", unsafe_allow_html=True)
+
+    if "fail_week_offset" not in st.session_state:
+        st.session_state["fail_week_offset"] = 0
+
+    offset = int(st.session_state["fail_week_offset"])
+    base = date.today() - timedelta(days=7 * offset)
+    ws = week_start(base)
+    we = ws + timedelta(days=6)
+
+    nav = st.columns([1, 3, 1])
+    with nav[0]:
+        if st.button("〈", use_container_width=True):
+            st.session_state["fail_week_offset"] += 1
+            st.rerun()
+    with nav[1]:
+        st.markdown(f"<div style='text-align:center; font-weight:650;'>{ws.isoformat()} ~ {we.isoformat()}</div>", unsafe_allow_html=True)
+    with nav[2]:
+        if st.button("〉", use_container_width=True, disabled=(offset == 0)):
+            st.session_state["fail_week_offset"] = max(0, offset - 1)
+            st.rerun()
+
+    df = get_tasks_range(ws, we)
+    if df.empty:
+        st.info("이 주에는 기록이 없어요.")
+        return
+
+    df = df.copy()
+    df["task_date"] = pd.to_datetime(df["task_date"]).dt.date
+
+    # --- Weekly fail chart
+    st.markdown("<div class='card'>", unsafe_allow_html=True)
+    st.markdown("### 주간 실패 차트")
+    fails = df[df["status"] == "fail"].copy()
+    # counts per day
+    day_counts = {d: 0 for d in week_days(ws)}
+    for d, g in fails.groupby("task_date"):
+        day_counts[d] = len(g)
+    chart_df = pd.DataFrame({"date": list(day_counts.keys()), "fail_count": list(day_counts.values())})
+    chart_df["label"] = chart_df["date"].apply(lambda d: f"{korean_dow(d.weekday())}\n{d.day}")
+    st.bar_chart(chart_df.set_index("label")["fail_count"])
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    st.write("")
+
+    # --- Weekly reason analysis (LLM)
+    st.markdown("<div class='card'>", unsafe_allow_html=True)
+    st.markdown("### 실패 원인 분석(주간)")
+
+    api_key = effective_openai_key()
+    model = get_setting("openai_model", "gpt-4o-mini")
+
+    weekly_reasons = [r for r in fails["fail_reason"].fillna("").tolist() if str(r).strip()]
+
+    if not api_key:
+        st.info("OpenAI 키가 설정되면 주간 원인 분석이 표시돼요. (하단에서 키 입력)")
+    elif len(weekly_reasons) == 0:
+        st.write("이번 주에는 실패 원인 입력이 아직 없어요. 실패 시 한 문장만 남겨도 분석이 좋아져요.")
+    else:
+        if st.button("주간 분석 생성/갱신", use_container_width=True):
+            try:
+                st.session_state["weekly_analysis"] = llm_weekly_reason_analysis(api_key, model, weekly_reasons)
+            except Exception as e:
+                st.error(f"분석 생성 실패: {type(e).__name__}")
+
+        analysis = st.session_state.get("weekly_analysis")
+        if analysis and isinstance(analysis, dict):
+            groups = analysis.get("groups", [])
+            if not groups:
+                st.write("분석 결과가 비어 있어요. 이유를 조금 더 모은 뒤 다시 시도해보세요.")
+            else:
+                for g in groups[:3]:
+                    with st.container(border=True):
+                        st.markdown(f"**{g.get('cause','원인')}**  ·  ~{g.get('estimated_count',0)}회")
+                        st.write(g.get("description", ""))
+                        ex = g.get("examples", []) or []
+                        if ex:
+                            st.caption("예시")
+                            for s in ex[:3]:
+                                st.write(f"- {s}")
+
+    st.markdown("</div>", unsafe_allow_html=True)
+    st.write("")
+
+    # --- Overall coaching + Chatbot
+    st.markdown("<div class='card'>", unsafe_allow_html=True)
+    st.markdown("### AI 코칭(누적)")
+
+    if not api_key:
+        st.info("OpenAI 키가 설정되면 코칭/챗봇이 표시돼요. (하단에서 키 입력)")
+        st.markdown("</div>", unsafe_allow_html=True)
+        return
+
+    all_fail = get_all_failures(limit=250)
+    if all_fail.empty:
+        st.write("아직 실패 데이터가 없어요. 👍")
+        st.markdown("</div>", unsafe_allow_html=True)
+        return
+
+    # repeated flags across all failures
+    flags = repeated_reason_flags(all_fail.rename(columns={"fail_reason": "fail_reason", "task_date": "task_date"}))
+
+    # build coaching payload (recent sample)
+    items: List[Dict[str, Any]] = []
+    for _, r in all_fail.head(60).iterrows():
+        reason = str(r["fail_reason"] or "")
+        rnorm = normalize_reason(reason)
+        items.append(
+            {
+                "date": str(r["task_date"]),
+                "task": str(r["text"]),
+                "reason": reason,
+                "repeated_2w": bool(flags.get(rnorm, False)),
+            }
+        )
+
+    colA, colB = st.columns([1.2, 2.8])
+    with colA:
+        if st.button("코칭 생성/갱신", use_container_width=True):
+            try:
+                st.session_state["overall_coach"] = llm_overall_coaching(api_key, model, items)
+            except Exception as e:
+                st.error(f"코칭 생성 실패: {type(e).__name__}")
+
+    coach = st.session_state.get("overall_coach")
+    if coach and isinstance(coach, dict):
+        top = coach.get("top_causes", []) or []
+        if not top:
+            st.write("코칭 결과가 비어 있어요. 실패 이유를 더 모은 뒤 다시 시도해보세요.")
+        else:
+            for i, c in enumerate(top[:3], start=1):
+                with st.container(border=True):
+                    st.markdown(f"**{i}) {c.get('cause','원인')}**")
+                    st.write(c.get("summary", ""))
+                    st.markdown("**실행 조언(현실 버전)**")
+                    for tip in (c.get("actionable_advice") or [])[:3]:
+                        st.write(f"- {tip}")
+                    creative = c.get("creative_advice_when_repeated_2w") or []
+                    if creative:
+                        st.markdown("**2주+ 반복이면: 다른 각도의 대안(창의 버전)**")
+                        for tip in creative[:2]:
+                            st.write(f"- {tip}")
+    else:
+        st.caption("‘코칭 생성/갱신’을 눌러 누적 코칭을 받아보세요.")
+
+    st.markdown("<hr/>", unsafe_allow_html=True)
+    st.markdown("### 챗봇")
+    st.markdown("<div class='small'>코칭 톤(비난 없이, 실행 가능/현실적인 조언)으로 답해요.</div>", unsafe_allow_html=True)
+
+    if "chat_messages" not in st.session_state:
+        st.session_state["chat_messages"] = []
+
+    # chat history render
+    for m in st.session_state["chat_messages"]:
+        with st.chat_message(m["role"]):
+            st.write(m["content"])
+
+    user_msg = st.chat_input("무엇이든 물어보세요 (예: 이번 주 실패를 줄이는 한 가지 실험은?)")
+    if user_msg:
+        st.session_state["chat_messages"].append({"role": "user", "content": user_msg})
+        with st.chat_message("user"):
+            st.write(user_msg)
+
+        # compact context for system
+        # quick stats: last 14 days fail reasons top
+        today = date.today()
+        last14 = get_tasks_range(today - timedelta(days=13), today)
+        last14_fail = last14[last14["status"] == "fail"]
+        top_reasons = (
+            last14_fail["fail_reason"].fillna("").map(lambda s: s.strip()).value_counts().head(5).to_dict()
+            if not last14_fail.empty
+            else {}
+        )
+
+        system_context = f"""
+너는 실패 기록 기반 코칭 챗봇이야.
+원칙:
+- 비난/자책 유도 금지
+- 실행 가능하고 현실적인 조언(작게, 구체적으로)
+- 사용자의 상황을 '조건' 관점에서 다뤄
+- 반복 실패(2주+)가 보이면 다른 각도의 창의적 대안을 제시
+
+사용자 데이터 요약:
+- 최근 14일 실패 이유 상위: {json.dumps(top_reasons, ensure_ascii=False)}
+- 누적 실패 샘플(최근 10개): {json.dumps(items[:10], ensure_ascii=False)}
+
+대화에서는 질문에 답하면서, 필요하면 '다음에 시도할 1가지 실험'을 제안해.
+""".strip()
+
+        try:
+            assistant_text = llm_chat(api_key, model, system_context, st.session_state["chat_messages"][-12:])
+        except Exception as e:
+            assistant_text = f"(OpenAI 호출 오류: {type(e).__name__}) 키/모델을 확인해 주세요."
+
+        st.session_state["chat_messages"].append({"role": "assistant", "content": assistant_text})
+        with st.chat_message("assistant"):
+            st.write(assistant_text)
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
+# =========================
+# 상단 네비(2화면)
+# =========================
+def top_nav():
+    if "screen" not in st.session_state:
+        st.session_state["screen"] = "planner"
+
+    c1, c2, c3 = st.columns([1, 1, 6])
+    with c1:
+        if st.button("📅 플래너", use_container_width=True):
+            st.session_state["screen"] = "planner"
+    with c2:
+        if st.button("⚠️ 실패", use_container_width=True):
+            st.session_state["screen"] = "fail"
+
+    st.write("")
+    return st.session_state["screen"]
+
+
+# =========================
+# Main
+# =========================
+def main():
+    st.set_page_config(page_title="Planner + Fail Coach", page_icon="🧭", layout="wide")
+    inject_css()
+    init_db()
+
+    st.markdown("# 🧭 Planner")
+    st.markdown("<div class='small'>달력형 플래너 + 실패 분석 + 코칭(비난 없이)</div>", unsafe_allow_html=True)
+    st.write("")
+
+    screen = top_nav()
+
+    if screen == "planner":
+        screen_planner()
+    else:
+        screen_failures()
+
+    # 하단 OpenAI 설정(요청사항)
+    render_openai_bottom_panel()
 
 
 if __name__ == "__main__":
