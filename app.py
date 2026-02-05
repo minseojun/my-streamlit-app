@@ -169,18 +169,25 @@ hr {{
 # USER ID (cookie-based)
 # =========================
 def get_or_create_user_id() -> str:
-    """
-    기기(브라우저)별로 고정되는 user_id.
-    - same browser -> same cookie -> same user_id
-    - different device -> different cookie -> different user_id
-    """
+    # 1) 세션에 이미 있으면 그걸 최우선으로 사용 (리런 안정성 확보)
+    if "user_id" in st.session_state and st.session_state["user_id"]:
+        return st.session_state["user_id"]
+
     cookie = stx.CookieManager()
     uid = cookie.get("failog_uid")
-    if not uid:
-        uid = str(uuid.uuid4())
-        # expires_at=None: 브라우저가 유지하는 한 장기 쿠키(환경에 따라 다를 수 있음)
-        cookie.set("failog_uid", uid, expires_at=None)
-    return uid
+
+    # 2) 쿠키가 있으면 세션에도 고정
+    if uid:
+        st.session_state["user_id"] = uid
+        return uid
+
+    # 3) 쿠키가 없으면 새로 생성 -> 세션에 먼저 고정 -> 쿠키 저장
+    uid = str(uuid.uuid4())
+    st.session_state["user_id"] = uid
+    cookie.set("failog_uid", uid, expires_at=None)
+
+    # 4) 쿠키가 다음 리런에서 안정적으로 읽히도록 한번 리런(선택이지만 권장)
+    st.rerun()
 
 
 # =========================
@@ -1437,3 +1444,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
