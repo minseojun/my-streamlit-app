@@ -1,2 +1,6 @@
 streamlit
 openai
+pandas
+altair
+extra-streamlit-components
+streamlit-autorefresh
