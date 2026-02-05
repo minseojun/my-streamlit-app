@@ -4,4 +4,5 @@ pandas
 altair
 extra-streamlit-components
 streamlit-autorefresh
-steamlit-local-storage
+streamlit-local-storage
+
