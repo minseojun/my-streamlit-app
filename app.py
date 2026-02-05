@@ -1,26 +1,26 @@
 # failog_app.py
 # Streamlit app: failog (계획 실패 기록 → 원인 분류(저장) → 주간 리포트/트렌드/리마인더/코칭)
 #
+# ✅ 변경 사항(요청 반영)
+# - OpenAI API Key를 "앱에서 입력"해서 동작하도록 수정 (환경변수 의존 X)
+# - 키는 기본적으로 session_state에만 저장(브라우저 세션 종료 시 사라짐)
+# - 원하면 "로컬에 저장(설정 DB)" 옵션을 켤 수 있게 제공(선택)
+#
 # 포함 기능
 # 1) 데일리 체크(성공/실패 + 실패 이유 + 원인 카테고리 저장)
-# 2) 원인 카테고리별 파이차트/트렌드(주차별/일자별)
+# 2) 원인 카테고리별 분포/트렌드(주차별 라인차트, 분포 바차트)
 # 3) 습관/목표별 주간 리포트(성공률, 실패 Top 원인, 반복 실패 감지)
 # 4) 알림(리마인더)
-#    - 앱이 열려 있을 때: 설정한 시간대에 "미체크/대기" 항목이 있으면 화면 토스트/배너
-#    - OS/캘린더용: 매일 리마인더 .ics 파일 다운로드(가장 현실적인 크로스플랫폼)
+#    - 앱이 열려 있을 때: 설정 시간대에 미체크(pending) 있으면 배너/토스트
+#    - OS/캘린더용: 매일 리마인더 .ics 다운로드
 # 5) 코칭 생성(공통 원인 3개 이내 + 실행가능 조언 + 2주 이상 반복 원인에 창의 대안)
-#    - OpenAI 키가 있으면 LLM으로 더 섬세하게
-#    - 없으면 로컬 규칙 기반으로 동작
+#    - OpenAI Key 입력 시 LLM 기반
+#    - Key 미입력 시 Local(규칙 기반)로 폴백
 #
 # 실행:
 #   pip install streamlit pandas openai streamlit-autorefresh
-#   export OPENAI_API_KEY="..."
 #   streamlit run failog_app.py
-#
-# NOTE: Streamlit 리마인더는 "앱이 켜져 있을 때"만 동작합니다.
-#       지속 푸시 알림은 별도 백엔드/모바일/브라우저 푸시가 필요하므로, 여기서는 .ics 제공이 가장 실용적입니다.
 
-import os
 import re
 import json
 import sqlite3
@@ -36,7 +36,7 @@ try:
 except Exception:
     st_autorefresh = None
 
-# Optional: OpenAI
+# OpenAI
 try:
     from openai import OpenAI
 except Exception:
@@ -47,8 +47,8 @@ except Exception:
 # Config
 # -----------------------------
 APP_TITLE = "failog — 실패를 실행 전략으로 바꿔주는 코칭"
-DB_PATH = os.environ.get("FAILOG_DB_PATH", "failog.db")
-DEFAULT_TZ = "Asia/Seoul"  # UI 참고용(서버 시간은 환경에 의존)
+DB_PATH = "failog.db"
+DEFAULT_TZ = "Asia/Seoul"
 
 
 # -----------------------------
@@ -59,8 +59,11 @@ def now_iso():
 
 
 def today_local() -> date:
-    # Streamlit 서버가 로컬 타임존이 아닐 수도 있지만, 사용자 기준 단순 사용.
     return date.today()
+
+
+def week_start(d: date) -> date:
+    return d - timedelta(days=d.weekday())
 
 
 def normalize_text(text: str) -> str:
@@ -68,15 +71,6 @@ def normalize_text(text: str) -> str:
     t = re.sub(r"\s+", " ", t)
     t = re.sub(r"[^\w\s가-힣]", "", t)
     return t
-
-
-def week_start(d: date) -> date:
-    # Monday start
-    return d - timedelta(days=d.weekday())
-
-
-def to_date(s: str) -> date:
-    return datetime.fromisoformat(s).date()
 
 
 # -----------------------------
@@ -135,14 +129,14 @@ def init_db():
         """
     )
 
-    # taxonomy table for causes (editable)
+    # taxonomy
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS cause_taxonomy (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL UNIQUE,
             description TEXT,
-            keywords TEXT, -- JSON array string
+            keywords TEXT,
             active INTEGER NOT NULL DEFAULT 1,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
@@ -163,10 +157,10 @@ def init_db():
 
     conn.commit()
 
-    # migrations for daily_logs: store cause classification
+    # migrations for daily_logs: cause fields
     ensure_column(conn, "daily_logs", "cause_name", "TEXT", None)
     ensure_column(conn, "daily_logs", "cause_source", "TEXT", "'none'")  # user|ai|rule|none
-    ensure_column(conn, "daily_logs", "cause_confidence", "REAL", "0.0")  # 0~1
+    ensure_column(conn, "daily_logs", "cause_confidence", "REAL", "0.0")
     ensure_column(conn, "daily_logs", "cause_updated_at", "TEXT", None)
 
     conn.commit()
@@ -175,11 +169,16 @@ def init_db():
     n = cur.execute("SELECT COUNT(*) FROM cause_taxonomy;").fetchone()[0]
     if n == 0:
         seed = [
-            ("시간/일정", "회의/야근/이동/마감 등으로 시간이 밀리거나 계획 타이밍이 깨진 경우", ["시간", "야근", "회의", "일정", "약속", "마감", "이동", "출근", "늦"]),
-            ("에너지/컨디션", "피로/수면/컨디션 저하로 실행 에너지가 부족한 경우", ["피곤", "졸림", "잠", "컨디션", "지침", "아파", "두통"]),
-            ("환경/방해요인", "폰/SNS/유튜브/소음/침대 등 방해자극이 강했던 경우", ["폰", "휴대폰", "유튜브", "sns", "방해", "소음", "침대", "게임", "넷플"]),
-            ("계획/설계", "목표가 과도하거나 구체성이 부족해서 시작/유지가 어려웠던 경우", ["너무", "과하게", "무리", "계획", "목표", "분량", "우선순위", "정리"]),
-            ("동기/의미", "의욕 저하/귀찮음/미루기/의미 부족으로 실행이 끊긴 경우", ["의욕", "동기", "귀찮", "하기싫", "의미", "미룸", "미루"]),
+            ("시간/일정", "회의/야근/이동/마감 등으로 시간이 밀리거나 계획 타이밍이 깨진 경우",
+             ["시간", "야근", "회의", "일정", "약속", "마감", "이동", "출근", "늦"]),
+            ("에너지/컨디션", "피로/수면/컨디션 저하로 실행 에너지가 부족한 경우",
+             ["피곤", "졸림", "잠", "컨디션", "지침", "아파", "두통"]),
+            ("환경/방해요인", "폰/SNS/유튜브/소음/침대 등 방해자극이 강했던 경우",
+             ["폰", "휴대폰", "유튜브", "sns", "방해", "소음", "침대", "게임", "넷플"]),
+            ("계획/설계", "목표가 과도하거나 구체성이 부족해서 시작/유지가 어려웠던 경우",
+             ["너무", "과하게", "무리", "계획", "목표", "분량", "우선순위", "정리"]),
+            ("동기/의미", "의욕 저하/귀찮음/미루기/의미 부족으로 실행이 끊긴 경우",
+             ["의욕", "동기", "귀찮", "하기싫", "의미", "미룸", "미루"]),
             ("기타(명확화 필요)", "분류가 애매하거나 이유가 불명확한 경우(다음 기록 때 한 문장 더 구체화)", []),
         ]
         for name, desc, kws in seed:
@@ -200,12 +199,41 @@ def init_db():
         )
 
     set_default("reminder_enabled", "true")
-    set_default("reminder_time", "21:30")  # HH:MM
-    set_default("reminder_window_min", "15")  # minutes
-    set_default("reminder_poll_sec", "60")  # seconds
-    conn.commit()
+    set_default("reminder_time", "21:30")
+    set_default("reminder_window_min", "15")
+    set_default("reminder_poll_sec", "60")
 
+    # optional: store api key (user can choose to enable)
+    set_default("openai_api_key", "")
+    set_default("openai_model", "gpt-4o-mini")
+
+    conn.commit()
     conn.close()
+
+
+# -----------------------------
+# Settings
+# -----------------------------
+def upsert_setting(key: str, value: str):
+    conn = get_conn()
+    conn.execute(
+        """
+        INSERT INTO settings (key, value, updated_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at
+        """,
+        (key, value, now_iso()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_setting(key: str, default: str) -> str:
+    conn = get_conn()
+    cur = conn.cursor()
+    row = cur.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    conn.close()
+    return row[0] if row else default
 
 
 # -----------------------------
@@ -309,7 +337,7 @@ def update_log_fail(
         WHERE id=?
         """,
         (
-            reason.strip() if reason else "이유 미기록",
+            (reason.strip() if reason else "이유 미기록"),
             cause_name,
             cause_source,
             float(cause_confidence),
@@ -379,7 +407,7 @@ def get_logs_range(start_date: date, end_date: date, active_only: bool = False) 
 
 
 # -----------------------------
-# Taxonomy + Settings
+# Taxonomy
 # -----------------------------
 def list_causes(active_only: bool = True) -> pd.DataFrame:
     conn = get_conn()
@@ -390,28 +418,6 @@ def list_causes(active_only: bool = True) -> pd.DataFrame:
     df = pd.read_sql_query(q, conn)
     conn.close()
     return df
-
-
-def upsert_setting(key: str, value: str):
-    conn = get_conn()
-    conn.execute(
-        """
-        INSERT INTO settings (key, value, updated_at)
-        VALUES (?, ?, ?)
-        ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at
-        """,
-        (key, value, now_iso()),
-    )
-    conn.commit()
-    conn.close()
-
-
-def get_setting(key: str, default: str) -> str:
-    conn = get_conn()
-    cur = conn.cursor()
-    row = cur.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
-    conn.close()
-    return row[0] if row else default
 
 
 def add_cause(name: str, description: str, keywords_list: List[str]):
@@ -438,10 +444,20 @@ def set_cause_active(cause_id: int, active: bool):
 
 
 # -----------------------------
-# Classification (OpenAI / Fallback keyword)
+# OpenAI helpers (KEY INPUT from UI)
+# -----------------------------
+def get_openai_client(api_key: str) -> OpenAI:
+    if OpenAI is None:
+        raise RuntimeError("openai 패키지가 설치되지 않았어요. pip install openai")
+    if not api_key or not api_key.strip():
+        raise RuntimeError("OpenAI API Key가 비어 있어요.")
+    return OpenAI(api_key=api_key.strip())
+
+
+# -----------------------------
+# Classification (OpenAI / Fallback)
 # -----------------------------
 def fallback_classify_reason(reason: str, causes_df: pd.DataFrame) -> Tuple[str, float, str]:
-    """Return (cause_name, confidence, source)."""
     r = (reason or "").lower()
     best = ("기타(명확화 필요)", 0.35)
     for _, row in causes_df.iterrows():
@@ -460,13 +476,8 @@ def fallback_classify_reason(reason: str, causes_df: pd.DataFrame) -> Tuple[str,
     return best[0], best[1], "rule"
 
 
-def openai_classify_reason(reason: str, cause_names: List[str]) -> Tuple[str, float, str]:
-    api_key = os.environ.get("OPENAI_API_KEY", "").strip()
-    if not api_key or OpenAI is None:
-        raise RuntimeError("OpenAI not configured.")
-    client = OpenAI(api_key=api_key)
-    model = os.environ.get("FAILOG_OPENAI_MODEL", "gpt-4o-mini")
-
+def openai_classify_reason(api_key: str, model: str, reason: str, cause_names: List[str]) -> Tuple[str, float, str]:
+    client = get_openai_client(api_key)
     prompt = f"""
 너는 사용자의 '계획 실패 이유'를 아래 원인 카테고리 중 하나로 분류해.
 카테고리 목록: {json.dumps(cause_names, ensure_ascii=False)}
@@ -499,28 +510,30 @@ confidence는 0~1 (확신이 낮으면 0.4~0.6)
             raise
         obj = json.loads(m.group(0))
 
-    cause = obj.get("cause", "").strip()
+    cause = str(obj.get("cause", "")).strip()
     conf = float(obj.get("confidence", 0.5))
     if cause not in cause_names:
-        # safety: snap to 기타
         cause = "기타(명확화 필요)" if "기타(명확화 필요)" in cause_names else cause_names[-1]
         conf = min(conf, 0.55)
     conf = max(0.0, min(1.0, conf))
     return cause, conf, "ai"
 
 
-def classify_reason(reason: str, prefer_openai: bool = True) -> Tuple[str, float, str]:
+def classify_reason(reason: str, api_key: str, model: str) -> Tuple[str, float, str]:
     causes_df = list_causes(active_only=True)
     cause_names = causes_df["name"].tolist()
-    if not reason.strip():
-        # 빈 이유는 기타로
+
+    if not (reason or "").strip():
         return ("기타(명확화 필요)" if "기타(명확화 필요)" in cause_names else cause_names[-1], 0.35, "rule")
 
-    if prefer_openai:
+    # Prefer OpenAI if key exists
+    if api_key and api_key.strip():
         try:
-            return openai_classify_reason(reason, cause_names)
+            return openai_classify_reason(api_key, model, reason, cause_names)
         except Exception:
+            # fall back
             pass
+
     return fallback_classify_reason(reason, causes_df)
 
 
@@ -528,9 +541,6 @@ def classify_reason(reason: str, prefer_openai: bool = True) -> Tuple[str, float
 # Repeated detection (>=14 days) by CAUSE (plan_id + cause_name)
 # -----------------------------
 def detect_repeated_causes_2w(failures_df: pd.DataFrame) -> Dict[Tuple[int, str], bool]:
-    """
-    Returns flags for (plan_id, cause_name) if failures span >= 14 days within the analysis window.
-    """
     if failures_df.empty:
         return {}
     df = failures_df.copy()
@@ -586,13 +596,8 @@ def build_coach_prompt(items: List[Dict[str, Any]]) -> str:
 """.strip()
 
 
-def openai_coach(items: List[Dict[str, Any]]) -> Dict[str, Any]:
-    api_key = os.environ.get("OPENAI_API_KEY", "").strip()
-    if not api_key or OpenAI is None:
-        raise RuntimeError("OpenAI not configured.")
-    client = OpenAI(api_key=api_key)
-    model = os.environ.get("FAILOG_OPENAI_MODEL", "gpt-4o-mini")
-
+def openai_coach(api_key: str, model: str, items: List[Dict[str, Any]]) -> Dict[str, Any]:
+    client = get_openai_client(api_key)
     resp = client.chat.completions.create(
         model=model,
         messages=[
@@ -616,7 +621,6 @@ def fallback_coach(items: List[Dict[str, Any]]) -> Dict[str, Any]:
         return {"top_causes": [], "tone_note": "기록이 비어 있어 분석 대신 다음 기록을 기다리고 있어요."}
 
     df = pd.DataFrame(items)
-    # count by cause
     counts = df["cause"].value_counts().head(3)
 
     top_causes = []
@@ -648,18 +652,23 @@ def fallback_coach(items: List[Dict[str, Any]]) -> Dict[str, Any]:
     return {"top_causes": top_causes, "tone_note": "실패를 탓이 아니라 '조정 가능한 조건 데이터'로 다루는 톤을 유지했어요."}
 
 
-def run_coaching(items: List[Dict[str, Any]]) -> Tuple[Dict[str, Any], str]:
-    try:
-        return openai_coach(items), "OpenAI"
-    except Exception:
-        return fallback_coach(items), "Local"
+def run_coaching(api_key: str, model: str, items: List[Dict[str, Any]]) -> Tuple[Dict[str, Any], str]:
+    # If key exists, try OpenAI, else fallback
+    if api_key and api_key.strip():
+        try:
+            return openai_coach(api_key, model, items), "OpenAI"
+        except Exception as e:
+            # Show a gentle hint in UI; still return fallback
+            st.warning(f"OpenAI 호출에 실패해서 로컬 코칭으로 대체했어요. (원인: {type(e).__name__})")
+            return fallback_coach(items), "Local"
+    return fallback_coach(items), "Local"
 
 
 # -----------------------------
 # Reminder: in-app + .ics
 # -----------------------------
 def parse_hhmm(s: str) -> time:
-    s = s.strip()
+    s = (s or "").strip()
     m = re.match(r"^(\d{1,2}):(\d{2})$", s)
     if not m:
         return time(21, 30)
@@ -692,12 +701,10 @@ def count_pending_today(d: date) -> int:
 
 
 def build_daily_ics(reminder_t: time) -> str:
-    # Recurring daily event, floating local time
     dtstamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
     start = datetime.combine(today_local(), reminder_t).strftime("%Y%m%dT%H%M%S")
     uid = f"failog-reminder-{dtstamp}@local"
-    # Keep it simple; users can import into Google/Apple Calendar.
-    ics = f"""BEGIN:VCALENDAR
+    return f"""BEGIN:VCALENDAR
 VERSION:2.0
 PRODID:-//failog//Reminder//EN
 CALSCALE:GREGORIAN
@@ -712,17 +719,65 @@ DESCRIPTION:오늘의 계획을 성공/실패로 체크하고, 실패라면 이�
 END:VEVENT
 END:VCALENDAR
 """
-    return ics
 
 
 # -----------------------------
-# UI
+# Sidebar: OpenAI Key UI
+# -----------------------------
+def sidebar_openai_panel():
+    st.sidebar.header("🔑 OpenAI 설정")
+
+    # Load defaults from DB (optional) for convenience
+    db_model = get_setting("openai_model", "gpt-4o-mini")
+    db_key = get_setting("openai_api_key", "")
+
+    if "openai_api_key" not in st.session_state:
+        st.session_state["openai_api_key"] = ""  # default empty
+
+    # input
+    api_key = st.sidebar.text_input(
+        "OpenAI API Key",
+        value=st.session_state["openai_api_key"],
+        type="password",
+        placeholder="sk-...",
+        help="기본적으로 세션에만 저장돼요(브라우저 닫으면 사라짐).",
+    )
+    st.session_state["openai_api_key"] = api_key
+
+    model = st.sidebar.text_input("모델", value=db_model, help="예: gpt-4o-mini / gpt-4.1-mini 등")
+    st.sidebar.caption("키가 비어 있으면 로컬(규칙 기반)로 동작합니다.")
+
+    # optional persistence
+    persist = st.sidebar.toggle("키를 로컬(DB)에 저장", value=False, help="공용 PC에서는 비추천")
+    if st.sidebar.button("설정 저장", use_container_width=True):
+        upsert_setting("openai_model", model.strip() or "gpt-4o-mini")
+        if persist:
+            upsert_setting("openai_api_key", api_key.strip())
+            st.sidebar.success("모델/키를 저장했어요.")
+        else:
+            upsert_setting("openai_api_key", "")
+            st.sidebar.success("모델만 저장했고, 키는 세션에만 남겨두었어요.")
+
+    # If user previously stored key in DB and wants to use it:
+    use_db_key = st.sidebar.toggle("저장된 키 사용", value=False, help="DB에 저장된 키가 있을 때만 의미 있어요.")
+    effective_key = api_key.strip()
+    if use_db_key and db_key.strip():
+        effective_key = db_key.strip()
+
+    return effective_key, (model.strip() or "gpt-4o-mini")
+
+
+# -----------------------------
+# Main App
 # -----------------------------
 def main():
     st.set_page_config(page_title="failog", page_icon="🧭", layout="wide")
     init_db()
 
-    # Reminder polling
+    # Sidebar OpenAI
+    effective_api_key, openai_model = sidebar_openai_panel()
+
+    # Reminder settings
     reminder_enabled = get_setting("reminder_enabled", "true").lower() == "true"
     reminder_time = parse_hhmm(get_setting("reminder_time", "21:30"))
     reminder_window = int(get_setting("reminder_window_min", "15"))
@@ -735,21 +790,11 @@ def main():
     if reminder_enabled:
         pending = count_pending_today(today_local())
         if pending > 0 and should_show_reminder(datetime.now(), reminder_time, reminder_window):
-            st.toast(f"리마인더: 아직 체크하지 않은 항목이 {pending}개 있어요. (오늘만 가볍게 정리해도 충분해요)", icon="⏰")
+            st.toast(f"리마인더: 아직 체크하지 않은 항목이 {pending}개 있어요. (가볍게 체크만 해도 충분해요)", icon="⏰")
             st.info(f"⏰ 오늘 체크가 아직 {pending}개 남아 있어요. 실패여도 괜찮아요. 한 문장만 남기면 내일이 쉬워져요.")
 
     st.title(APP_TITLE)
-    st.caption("실패는 데이터예요. 비난 없이, 조건을 조정하는 코칭으로 바꿔요.")
-
-    with st.expander("🔐 OpenAI 설정(선택)", expanded=False):
-        st.write("- 환경변수 `OPENAI_API_KEY`가 있으면 더 섬세한 분류/코칭이 가능합니다.")
-        st.write("- 없으면 로컬 규칙 기반으로 동작합니다.")
-        st.code(
-            "export OPENAI_API_KEY='YOUR_KEY'\n"
-            "export FAILOG_OPENAI_MODEL='gpt-4o-mini'  # 선택\n"
-            "streamlit run failog_app.py",
-            language="bash",
-        )
+    st.caption("실패는 ‘탓’이 아니라 ‘조건 데이터’예요. 비난 없이 코칭으로 바꿔요.")
 
     tab_daily, tab_report, tab_analysis, tab_manage = st.tabs(
         ["✅ 데일리 체크", "🗓️ 주간 리포트", "📈 원인 트렌드 & 코칭", "⚙️ 관리(계획/원인/알림)"]
@@ -783,7 +828,9 @@ def main():
                             st.markdown(f"**{row['plan_title']}**")
                             st.caption(f"상태: `{row['status']}`")
                             if row.get("cause_name"):
-                                st.caption(f"원인: {row['cause_name']} ({row.get('cause_source','')}, {row.get('cause_confidence',0):.2f})")
+                                st.caption(
+                                    f"원인: {row['cause_name']} ({row.get('cause_source','')}, {row.get('cause_confidence',0):.2f})"
+                                )
 
                         with c2:
                             b1, b2, b3 = st.columns([1, 1, 1])
@@ -798,7 +845,6 @@ def main():
                                     st.info("대기로 되돌렸어요.")
                                     st.rerun()
                             with b3:
-                                # placeholder for spacing
                                 st.write("")
 
                             reason_key = f"reason_{row['id']}"
@@ -807,14 +853,18 @@ def main():
                             default_reason = row["reason"] if row["reason"] else ""
                             reason = st.text_input("실패 이유(한 문장)", value=default_reason, key=reason_key)
 
-                            # cause selection
                             default_cause = row["cause_name"] if row["cause_name"] in cause_names else "자동 분류"
                             options = ["자동 분류"] + cause_names
-                            cause_sel = st.selectbox("원인 카테고리", options=options, index=options.index(default_cause) if default_cause in options else 0, key=cause_key)
+                            cause_sel = st.selectbox(
+                                "원인 카테고리",
+                                options=options,
+                                index=options.index(default_cause) if default_cause in options else 0,
+                                key=cause_key,
+                            )
 
                             if st.button("실패 ❌ 저장", key=f"fail_save_{row['id']}"):
                                 if cause_sel == "자동 분류":
-                                    cause, conf, src = classify_reason(reason, prefer_openai=True)
+                                    cause, conf, src = classify_reason(reason, effective_api_key, openai_model)
                                 else:
                                     cause, conf, src = cause_sel, 1.0, "user"
                                 update_log_fail(int(row["id"]), reason, cause, src, conf)
@@ -835,54 +885,32 @@ def main():
         if logs.empty:
             st.info("이 주차에는 기록이 없어요.")
         else:
-            # overall summary by plan
-            def plan_week_summary(df: pd.DataFrame) -> pd.DataFrame:
-                x = df.copy()
-                x["is_success"] = (x["status"] == "success").astype(int)
-                x["is_fail"] = (x["status"] == "fail").astype(int)
-                x["is_pending"] = (x["status"] == "pending").astype(int)
-                g = x.groupby(["plan_id", "plan_title"], as_index=False).agg(
-                    success=("is_success", "sum"),
-                    fail=("is_fail", "sum"),
-                    pending=("is_pending", "sum"),
-                )
-                g["checked"] = g["success"] + g["fail"]
-                g["success_rate"] = g.apply(lambda r: (r["success"] / r["checked"]) if r["checked"] else 0.0, axis=1)
-                return g.sort_values(["success_rate", "checked"], ascending=[False, False])
-
-            summary = plan_week_summary(logs)
-            summary_show = summary.copy()
+            x = logs.copy()
+            x["is_success"] = (x["status"] == "success").astype(int)
+            x["is_fail"] = (x["status"] == "fail").astype(int)
+            x["is_pending"] = (x["status"] == "pending").astype(int)
+            summary = x.groupby(["plan_id", "plan_title"], as_index=False).agg(
+                success=("is_success", "sum"),
+                fail=("is_fail", "sum"),
+                pending=("is_pending", "sum"),
+            )
+            summary["checked"] = summary["success"] + summary["fail"]
+            summary["success_rate"] = summary.apply(lambda r: (r["success"] / r["checked"]) if r["checked"] else 0.0, axis=1)
+            summary_show = summary.sort_values(["success_rate", "checked"], ascending=[False, False]).copy()
             summary_show["success_rate"] = (summary_show["success_rate"] * 100).round(1).astype(str) + "%"
             st.dataframe(summary_show, use_container_width=True, hide_index=True)
 
-            # per-plan details
             st.markdown("### 계획별 상세")
             failures = logs[logs["status"] == "fail"].copy()
             failures["cause_name"] = failures["cause_name"].fillna("기타(명확화 필요)")
-            repeated_flags = detect_repeated_causes_2w(
-                get_failures(ws - timedelta(days=21), we)  # look-back 포함: 반복 감지에 유리
-            )
+            repeated_flags = detect_repeated_causes_2w(get_failures(ws - timedelta(days=21), we))
 
-            plans = summary[["plan_id", "plan_title"]].values.tolist()
-            for pid, title in plans:
+            for _, row in summary.sort_values(["success_rate", "checked"], ascending=[False, False]).iterrows():
+                pid, title = int(row["plan_id"]), row["plan_title"]
                 with st.container(border=True):
                     st.markdown(f"#### {title}")
-                    sub = logs[logs["plan_id"] == pid].copy()
-                    # streak calculation (simple: consecutive successes ending at week end)
-                    sub["log_date"] = pd.to_datetime(sub["log_date"]).dt.date
-                    sub_sorted = sub.sort_values("log_date")
-                    streak = 0
-                    # calculate ending streak up to we
-                    by_date = {r["log_date"]: r["status"] for _, r in sub_sorted.iterrows()}
-                    d = we
-                    while d >= ws:
-                        stt = by_date.get(d, "pending")
-                        if stt == "success":
-                            streak += 1
-                            d -= timedelta(days=1)
-                        else:
-                            break
 
+                    sub = logs[logs["plan_id"] == pid].copy()
                     succ = int((sub["status"] == "success").sum())
                     fail = int((sub["status"] == "fail").sum())
                     pend = int((sub["status"] == "pending").sum())
@@ -895,17 +923,14 @@ def main():
                     c3.metric("대기", pend)
                     c4.metric("주간 성공률", f"{rate*100:.1f}%")
 
-                    st.caption(f"주간 마감 기준 연속 성공(대략): {streak}일")
-
-                    # Top causes
                     fsub = failures[failures["plan_id"] == pid]
                     if fsub.empty:
-                        st.success("이번 주에는 실패 기록이 없어요. 이 페이스가 ‘기본값’이 되도록 가볍게 유지해요.")
+                        st.success("이번 주에는 실패 기록이 없어요. 이 흐름을 가볍게 유지해요.")
                     else:
                         topc = fsub["cause_name"].value_counts().head(3)
                         st.write("실패 Top 원인:")
                         for cause, cnt in topc.items():
-                            rep = repeated_flags.get((int(pid), str(cause)), False)
+                            rep = repeated_flags.get((pid, str(cause)), False)
                             tag = " (2주+ 반복 신호)" if rep else ""
                             st.write(f"- {cause}: {cnt}회{tag}")
 
@@ -924,26 +949,22 @@ def main():
         with colB:
             end_d = st.date_input("종료일", value=today_local(), key="an_end")
         with colC:
-            st.caption("저장된 원인 카테고리를 기준으로 파이/트렌드를 그리고, 공통 원인 3개 이내 코칭을 생성해요.")
+            st.caption("저장된 원인 카테고리를 기준으로 분포/트렌드를 그리고, 공통 원인 3개 이내 코칭을 생성해요.")
             st.caption("같은 원인이 2주 이상 반복되면(원인 단위) 해당 원인에 창의적 대안을 추가합니다.")
 
         start_d = end_d - timedelta(days=int(days) - 1)
-
         failures_df = get_failures(start_d, end_d)
 
-        # Backfill missing causes in the window (optional toggle)
         st.markdown("#### 원인 저장 상태")
         missing = int(failures_df["cause_name"].isna().sum()) if not failures_df.empty else 0
         st.write(f"- 이 기간 실패 중 원인 미저장: **{missing}건**")
         backfill = st.checkbox("이 기간의 원인 미저장 실패를 자동 분류해서 DB에 저장(추천)", value=False)
 
         if backfill and missing > 0:
-            # classify and store
             for _, r in failures_df[failures_df["cause_name"].isna()].iterrows():
                 cid = int(r["id"])
                 reason = r["reason"] or ""
-                cause, conf, src = classify_reason(reason, prefer_openai=True)
-                # update row without changing status
+                cause, conf, src = classify_reason(reason, effective_api_key, openai_model)
                 conn = get_conn()
                 conn.execute(
                     """
@@ -955,26 +976,22 @@ def main():
                 )
                 conn.commit()
                 conn.close()
-            st.success("자동 분류 저장 완료! (이제 다음 분석이 더 정확해져요)")
+            st.success("자동 분류 저장 완료! (다음 분석이 더 정확해져요)")
             failures_df = get_failures(start_d, end_d)
 
         if failures_df.empty:
             st.info("이 기간엔 실패 기록이 없어요. 👍 지금의 리듬을 유지해도 충분히 좋습니다.")
         else:
-            # normalize cause
             failures_df = failures_df.copy()
             failures_df["cause_name"] = failures_df["cause_name"].fillna("기타(명확화 필요)")
             failures_df["log_date"] = pd.to_datetime(failures_df["log_date"]).dt.date
 
-            # Pie chart
-            st.markdown("#### 원인 분포(파이)")
-            pie_df = failures_df["cause_name"].value_counts().reset_index()
-            pie_df.columns = ["cause", "count"]
-            st.dataframe(pie_df, use_container_width=True, hide_index=True)
-            # Streamlit native charts are limited; use bar as a clear default
-            st.bar_chart(pie_df.set_index("cause"))
+            st.markdown("#### 원인 분포")
+            dist = failures_df["cause_name"].value_counts().reset_index()
+            dist.columns = ["cause", "count"]
+            st.dataframe(dist, use_container_width=True, hide_index=True)
+            st.bar_chart(dist.set_index("cause"))
 
-            # Trend (weekly)
             st.markdown("#### 원인 트렌드(주차별)")
             tmp = failures_df.copy()
             tmp["week"] = tmp["log_date"].apply(lambda d: week_start(d).isoformat())
@@ -982,10 +999,8 @@ def main():
             pivot = trend.pivot(index="week", columns="cause_name", values="count").fillna(0).sort_index()
             st.line_chart(pivot)
 
-            # Repeated cause flags (within window)
             repeated_flags = detect_repeated_causes_2w(failures_df)
 
-            # Build coaching payload (cause-based)
             items = []
             for _, r in failures_df.iterrows():
                 pid = int(r["plan_id"])
@@ -1001,20 +1016,16 @@ def main():
                 )
 
             st.markdown("#### 코칭 생성")
-            colX, colY = st.columns([1, 3])
-            with colX:
-                run_btn = st.button("코칭 생성/갱신", type="primary", key="coach_run")
-            with colY:
-                st.caption("OpenAI 키가 있으면 더 자연스럽고 섬세하게, 없으면 로컬 규칙 기반으로 코칭을 생성합니다.")
+            run_btn = st.button("코칭 생성/갱신", type="primary", key="coach_run")
 
             if run_btn or ("coach_result" not in st.session_state):
-                result, engine = run_coaching(items)
+                result, engine = run_coaching(effective_api_key, openai_model, items)
                 st.session_state["coach_result"] = result
                 st.session_state["coach_engine"] = engine
 
             result = st.session_state.get("coach_result", {})
             engine = st.session_state.get("coach_engine", "Local")
-            st.write(f"사용 엔진: **{engine}**")
+            st.write(f"사용 엔진: **{engine}**  |  모델: **{openai_model}**")
 
             top_causes = result.get("top_causes", []) if isinstance(result.get("top_causes", []), list) else []
             if not top_causes:
@@ -1042,21 +1053,19 @@ def main():
                 st.dataframe(pd.DataFrame(items), use_container_width=True, hide_index=True)
 
     # -------------------------
-    # Tab 4: Manage (Plans / Causes / Reminder)
+    # Tab 4: Manage
     # -------------------------
     with tab_manage:
         st.subheader("관리")
-
         subtab_plans, subtab_causes, subtab_reminder, subtab_fix = st.tabs(
             ["계획", "원인 카테고리", "알림(리마인더)", "데이터 정리/수정"]
         )
 
-        # Plans
         with subtab_plans:
             col1, col2 = st.columns([2, 3])
             with col1:
                 st.markdown("#### 새 계획 추가")
-                new_title = st.text_input("계획/습관 이름", placeholder="예: 영어 단어 20개 / 운동 20분 / 논문 1페이지", key="new_plan")
+                new_title = st.text_input("계획/습관 이름", placeholder="예: 영어 단어 20개 / 운동 20분", key="new_plan")
                 if st.button("추가", key="add_plan_btn"):
                     if not new_title.strip():
                         st.error("계획 이름을 입력해 주세요.")
@@ -1064,12 +1073,6 @@ def main():
                         add_plan(new_title.strip())
                         st.success("추가 완료!")
                         st.rerun()
-
-                st.markdown("---")
-                st.markdown("#### 운영 팁")
-                st.write("- 계획은 작을수록 성공률이 올라가요.")
-                st.write("- 실패 이유는 길게 쓰지 않아도 돼요. 한 문장으로 충분해요.")
-                st.write("- 반복 실패는 ‘의지’보다 설계/환경의 신호일 때가 많아요.")
 
             with col2:
                 st.markdown("#### 내 계획 목록")
@@ -1096,36 +1099,32 @@ def main():
                                         set_plan_active(int(r["id"]), True)
                                         st.rerun()
 
-        # Causes taxonomy
         with subtab_causes:
             st.markdown("#### 원인 카테고리 목록(분류 기준)")
             causes_df = list_causes(active_only=False)
-            if causes_df.empty:
-                st.warning("원인 카테고리가 없어요.")
-            else:
-                for _, r in causes_df.iterrows():
-                    with st.container(border=True):
-                        c1, c2, c3 = st.columns([3, 5, 2])
-                        with c1:
-                            st.markdown(f"**{r['name']}**")
-                            st.caption("활성 ✅" if int(r["active"]) == 1 else "비활성 ⛔")
-                        with c2:
-                            st.write(r["description"] or "")
-                            try:
-                                kws = json.loads(r["keywords"] or "[]")
-                            except Exception:
-                                kws = []
-                            if kws:
-                                st.caption("키워드: " + ", ".join(kws))
-                        with c3:
-                            if int(r["active"]) == 1:
-                                if st.button("비활성화", key=f"cause_off_{r['id']}"):
-                                    set_cause_active(int(r["id"]), False)
-                                    st.rerun()
-                            else:
-                                if st.button("활성화", key=f"cause_on_{r['id']}"):
-                                    set_cause_active(int(r["id"]), True)
-                                    st.rerun()
+            for _, r in causes_df.iterrows():
+                with st.container(border=True):
+                    c1, c2, c3 = st.columns([3, 5, 2])
+                    with c1:
+                        st.markdown(f"**{r['name']}**")
+                        st.caption("활성 ✅" if int(r["active"]) == 1 else "비활성 ⛔")
+                    with c2:
+                        st.write(r["description"] or "")
+                        try:
+                            kws = json.loads(r["keywords"] or "[]")
+                        except Exception:
+                            kws = []
+                        if kws:
+                            st.caption("키워드: " + ", ".join(kws))
+                    with c3:
+                        if int(r["active"]) == 1:
+                            if st.button("비활성화", key=f"cause_off_{r['id']}"):
+                                set_cause_active(int(r["id"]), False)
+                                st.rerun()
+                        else:
+                            if st.button("활성화", key=f"cause_on_{r['id']}"):
+                                set_cause_active(int(r["id"]), True)
+                                st.rerun()
 
             st.markdown("---")
             st.markdown("#### 새 원인 카테고리 추가")
@@ -1144,13 +1143,14 @@ def main():
                     except sqlite3.IntegrityError:
                         st.error("이미 같은 이름의 원인이 있어요. 이름을 바꿔주세요.")
 
-        # Reminder
         with subtab_reminder:
             st.markdown("#### 리마인더 설정")
             enabled = st.toggle("리마인더 켜기", value=reminder_enabled, key="rem_en")
             rt = st.text_input("리마인더 시간(HH:MM)", value=get_setting("reminder_time", "21:30"), key="rem_time")
-            wm = st.number_input("표시 허용 오차(분)", min_value=1, max_value=120, value=int(get_setting("reminder_window_min", "15")), key="rem_win")
-            ps = st.number_input("앱 내 체크 주기(초)", min_value=10, max_value=600, value=int(get_setting("reminder_poll_sec", "60")), key="rem_poll")
+            wm = st.number_input("표시 허용 오차(분)", min_value=1, max_value=120,
+                                 value=int(get_setting("reminder_window_min", "15")), key="rem_win")
+            ps = st.number_input("앱 내 체크 주기(초)", min_value=10, max_value=600,
+                                 value=int(get_setting("reminder_poll_sec", "60")), key="rem_poll")
 
             if st.button("설정 저장", key="rem_save"):
                 upsert_setting("reminder_enabled", "true" if enabled else "false")
@@ -1161,7 +1161,7 @@ def main():
                 st.rerun()
 
             st.markdown("---")
-            st.markdown("#### 캘린더(구글/애플 등)로 리마인더 받기(.ics)")
+            st.markdown("#### 캘린더로 리마인더 받기(.ics)")
             t = parse_hhmm(rt)
             ics = build_daily_ics(t)
             st.download_button(
@@ -1172,7 +1172,6 @@ def main():
             )
             st.caption("다운로드 후 캘린더에 가져오기(import) 하면, 앱을 안 켜도 OS/캘린더 알림을 받을 수 있어요.")
 
-        # Fix / Edit existing causes on logs (manual correction)
         with subtab_fix:
             st.markdown("#### 실패 기록의 원인 수정(정확도 개선)")
             d1 = st.date_input("시작일", value=today_local() - timedelta(days=14), key="fix_s")
@@ -1183,14 +1182,25 @@ def main():
             else:
                 df = df.copy()
                 df["cause_name"] = df["cause_name"].fillna("기타(명확화 필요)")
-                st.dataframe(df[["id", "log_date", "plan_title", "reason", "cause_name", "cause_source", "cause_confidence"]],
-                             use_container_width=True, hide_index=True)
+                st.dataframe(
+                    df[["id", "log_date", "plan_title", "reason", "cause_name", "cause_source", "cause_confidence"]],
+                    use_container_width=True,
+                    hide_index=True,
+                )
 
                 st.markdown("원인 수정:")
                 causes_df = list_causes(active_only=True)
                 cause_names = causes_df["name"].tolist()
-                target_id = st.number_input("수정할 log id", min_value=int(df["id"].min()), max_value=int(df["id"].max()), value=int(df["id"].min()), step=1)
+
+                target_id = st.number_input(
+                    "수정할 log id",
+                    min_value=int(df["id"].min()),
+                    max_value=int(df["id"].max()),
+                    value=int(df["id"].min()),
+                    step=1,
+                )
                 new_cause = st.selectbox("새 원인", options=cause_names, index=0)
+
                 if st.button("원인 업데이트", key="fix_update"):
                     conn = get_conn()
                     conn.execute(
