@@ -1,24 +1,24 @@
 # app.py
 # ------------------------------------------------------------
-# 2-screen Streamlit app (깔끔/단순 버전)
+# 2-screen Streamlit app (깔끔/단순 + 오류 수정 + 삭제 지원)
+#
 # 1) 메인: 달력형 플래너
 #    - Month(작게) + Current Week(크게)
 #    - 날짜 선택 → 체크리스트(계획 + 습관)
-#    - 계획 추가(해당 날짜 1회성)
-#    - 습관 추가(반복): 월~일 선택 → 해당 주/날짜에 자동 생성
-#    - 각 항목: [성공] / [실패] 버튼
+#    - 계획 추가(해당 날짜 1회성) / 삭제
+#    - 습관 추가(반복: 요일 선택) / OFF / 삭제
+#    - 습관은 주간 화면 열 때 자동으로 체크리스트에 생성(중복 방지)
+#    - 각 항목: 성공 / 실패 버튼
 #      - 실패 누르면 해당 항목 아래에 실패 원인 입력칸 노출 → 저장
-#    - 앱 내부 리마인더(팝업/배너): 설정 시간대에 오늘 todo가 남아있으면 toast + info
+#    - 앱 내부 리마인더(팝업/배너): 설정 시간대에 오늘 todo 남아있으면 toast+info
 #
-# 2) 서브: 실패 화면
+# 2) 실패 화면
 #    - 주간 실패 차트(이번 주 기본, < 버튼으로 이전 주 이동)
-#    - 주간 실패 원인 분석(LLM): 이번 주 실패 이유를 3개 이내로 묶어 요약
-#    - 전체(누적) AI 코칭(LLM): 공통 원인 3개 이내 + 실행 조언 + 2주 이상 반복이면 창의 조언
-#    - 챗봇: 사용자가 질문/대화 가능(코칭 톤 유지)
+#    - 주간 실패 원인 분석(LLM)
+#    - 전체(누적) AI 코칭(LLM): 공통 원인 3개 이내 + 실행 조언 + 2주 반복이면 창의 조언
+#    - 챗봇(코칭 톤)
 #
-# OpenAI 키
-#  - 하단 입력칸(사이드바 X)
-#  - "로컬 저장" 스위치로 DB 저장 여부 선택(장기 사용)
+# OpenAI 키: 하단 입력 + 로컬 저장 토글(DB)
 #
 # Run:
 #   pip install streamlit pandas openai
@@ -29,7 +29,7 @@ import json
 import re
 import sqlite3
 from datetime import date, datetime, timedelta, time
-from typing import Optional, List, Dict, Any, Tuple
+from typing import Optional, List, Dict, Any
 
 import pandas as pd
 import streamlit as st
@@ -50,7 +50,7 @@ def inject_css():
 .block-container { max-width: 1100px; padding-top: 1.1rem; padding-bottom: 2rem; }
 h1,h2,h3 { letter-spacing: -0.02em; }
 .small { color: rgba(49,51,63,0.65); font-size: 0.92rem; }
-.card { border: 1px solid rgba(49,51,63,0.12); border-radius: 16px; padding: 14px 14px; background: rgba(255,255,255,0.9); }
+.card { border: 1px solid rgba(49,51,63,0.12); border-radius: 16px; padding: 14px 14px; background: rgba(255,255,255,0.92); }
 .pill { display:inline-block; padding:4px 10px; border-radius:999px; border:1px solid rgba(49,51,63,0.14); font-size:0.85rem; margin-right:6px; }
 .pill-strong { background: rgba(0,120,212,0.08); border-color: rgba(0,120,212,0.25); }
 .pill-weak { background: rgba(0,0,0,0.02); }
@@ -83,7 +83,7 @@ def init_db():
     c = conn()
     cur = c.cursor()
 
-    # 1회성 계획 + 습관으로 생성된 항목 모두 tasks에 저장
+    # tasks: plan/habit 모두 저장
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS tasks (
@@ -124,13 +124,12 @@ def init_db():
         """
     )
 
-    # defaults
     defaults = {
         "openai_api_key": "",
         "openai_model": "gpt-4o-mini",
         "reminder_enabled": "true",
-        "reminder_time": "21:30",       # HH:MM
-        "reminder_window_min": "15",    # minutes
+        "reminder_time": "21:30",
+        "reminder_window_min": "15",
     }
     for k, v in defaults.items():
         cur.execute(
@@ -182,10 +181,7 @@ def korean_dow(i: int) -> str:
 def month_grid(year: int, month: int) -> List[List[Optional[date]]]:
     first = date(year, month, 1)
     first_wd = first.weekday()  # Mon=0
-    if month == 12:
-        nxt = date(year + 1, 1, 1)
-    else:
-        nxt = date(year, month + 1, 1)
+    nxt = date(year + 1, 1, 1) if month == 12 else date(year, month + 1, 1)
     last = nxt - timedelta(days=1)
 
     grid: List[List[Optional[date]]] = []
@@ -252,8 +248,26 @@ def set_habit_active(habit_id: int, active: bool):
     c.close()
 
 
+def delete_habit(habit_id: int):
+    """
+    깔끔한 UX를 위해:
+    - 습관 자체는 삭제
+    - 해당 습관으로 '미래/오늘'에 생성된 todo 항목도 같이 정리(기록(과거 success/fail)은 남김)
+    """
+    today = date.today().isoformat()
+    c = conn()
+    cur = c.cursor()
+    cur.execute(
+        "DELETE FROM tasks WHERE source='habit' AND habit_id=? AND task_date>=? AND status='todo'",
+        (habit_id, today),
+    )
+    cur.execute("DELETE FROM habits WHERE id=?", (habit_id,))
+    c.commit()
+    c.close()
+
+
 def ensure_week_habit_tasks(ws: date):
-    """앱 열었을 때: 해당 주에 필요한 습관 항목을 자동으로 tasks에 생성(중복 방지 UNIQUE)."""
+    """해당 주에 필요한 습관 항목 자동 생성(중복 방지 UNIQUE)."""
     habits = list_habits(active_only=True)
     if habits.empty:
         return
@@ -288,12 +302,19 @@ def add_plan_task(d: date, text: str):
     c = conn()
     c.execute(
         """
-        INSERT OR IGNORE INTO tasks
+        INSERT INTO tasks
           (task_date, text, source, habit_id, status, fail_reason, created_at, updated_at)
         VALUES (?,?,?,?, 'todo', NULL, ?, ?)
         """,
         (d.isoformat(), text, "plan", None, now_iso(), now_iso()),
     )
+    c.commit()
+    c.close()
+
+
+def delete_task(task_id: int):
+    c = conn()
+    c.execute("DELETE FROM tasks WHERE id=?", (task_id,))
     c.commit()
     c.close()
 
@@ -406,7 +427,6 @@ def count_today_todos() -> int:
 # OpenAI 키(하단 입력)
 # =========================
 def effective_openai_key() -> str:
-    # 세션 우선, 없으면 DB 저장 키 사용
     sk = st.session_state.get("openai_api_key", "")
     if sk.strip():
         return sk.strip()
@@ -566,15 +586,16 @@ def render_openai_bottom_panel():
             value=st.session_state.get("openai_api_key", ""),
             type="password",
             placeholder="sk-...",
+            key="bottom_openai_key",
         )
     with col2:
-        model = st.text_input("모델", value=get_setting("openai_model", "gpt-4o-mini"))
+        model = st.text_input("모델", value=get_setting("openai_model", "gpt-4o-mini"), key="bottom_openai_model")
     with col3:
-        save = st.toggle("로컬 저장", value=False, help="공용 PC면 끄는 걸 추천")
+        save = st.toggle("로컬 저장", value=False, help="공용 PC면 끄는 걸 추천", key="bottom_openai_save")
 
     b1, b2 = st.columns([1, 4])
     with b1:
-        if st.button("적용", use_container_width=True):
+        if st.button("적용", use_container_width=True, key="bottom_apply"):
             st.session_state["openai_api_key"] = api_key.strip()
             set_setting("openai_model", (model.strip() or "gpt-4o-mini"))
             if save:
@@ -591,7 +612,6 @@ def screen_planner():
     st.markdown("## 📅 플래너")
     st.markdown("<div class='small'>Month는 전체 흐름, 아래는 <b>현재 주</b>를 크게 보여줘요.</div>", unsafe_allow_html=True)
 
-    # state
     if "selected_date" not in st.session_state:
         st.session_state["selected_date"] = date.today()
 
@@ -601,7 +621,7 @@ def screen_planner():
     # 습관 자동 생성
     ensure_week_habit_tasks(ws)
 
-    # reminder
+    # reminder popup
     if get_setting("reminder_enabled", "true").lower() == "true":
         rt = parse_hhmm(get_setting("reminder_time", "21:30"))
         win = int(get_setting("reminder_window_min", "15"))
@@ -621,7 +641,7 @@ def screen_planner():
         y, m = selected.year, selected.month
         nav = st.columns([1, 2, 1])
         with nav[0]:
-            if st.button("◀", use_container_width=True):
+            if st.button("◀", use_container_width=True, key="m_prev"):
                 if m == 1:
                     y -= 1
                     m = 12
@@ -630,9 +650,12 @@ def screen_planner():
                 st.session_state["selected_date"] = date(y, m, 1)
                 st.rerun()
         with nav[1]:
-            st.markdown(f"<div style='text-align:center; font-weight:650; font-size:1.05rem;'>{y}.{m:02d}</div>", unsafe_allow_html=True)
+            st.markdown(
+                f"<div style='text-align:center; font-weight:650; font-size:1.05rem;'>{y}.{m:02d}</div>",
+                unsafe_allow_html=True,
+            )
         with nav[2]:
-            if st.button("▶", use_container_width=True):
+            if st.button("▶", use_container_width=True, key="m_next"):
                 if m == 12:
                     y += 1
                     m = 1
@@ -667,12 +690,11 @@ def screen_planner():
 
         st.markdown("</div>", unsafe_allow_html=True)
 
-        # ---- Simple reminder settings (kept minimal; still 2 screens)
         with st.expander("알림 설정", expanded=False):
-            en = st.toggle("리마인더 켜기", value=get_setting("reminder_enabled", "true").lower() == "true")
-            t = st.text_input("시간(HH:MM)", value=get_setting("reminder_time", "21:30"))
-            w = st.number_input("허용 오차(분)", min_value=1, max_value=120, value=int(get_setting("reminder_window_min", "15")))
-            if st.button("저장", use_container_width=True):
+            en = st.toggle("리마인더 켜기", value=get_setting("reminder_enabled", "true").lower() == "true", key="rem_en")
+            t = st.text_input("시간(HH:MM)", value=get_setting("reminder_time", "21:30"), key="rem_time")
+            w = st.number_input("허용 오차(분)", min_value=1, max_value=120, value=int(get_setting("reminder_window_min", "15")), key="rem_win")
+            if st.button("저장", use_container_width=True, key="rem_save"):
                 set_setting("reminder_enabled", "true" if en else "false")
                 set_setting("reminder_time", (t or "21:30"))
                 set_setting("reminder_window_min", str(int(w)))
@@ -688,6 +710,7 @@ def screen_planner():
         )
         st.write("")
 
+        # week day buttons
         wcols = st.columns(7, gap="small")
         days = week_days(ws)
         for i, d in enumerate(days):
@@ -701,52 +724,69 @@ def screen_planner():
         st.markdown("<hr/>", unsafe_allow_html=True)
         st.markdown(f"#### {selected.isoformat()} ({korean_dow(selected.weekday())})")
 
-        # ---- Add plan (1-time)
-        c1, c2 = st.columns([4, 1])
-        with c1:
-            new_plan = st.text_input("계획 추가(1회성)", placeholder="예: 독서 10분 / 이메일 정리", key="new_plan_text")
-        with c2:
-            if st.button("추가", use_container_width=True):
-                add_plan_task(selected, new_plan)
-                st.session_state["new_plan_text"] = ""
+        # -------- 계획 추가(오류 방지: form + clear_on_submit)
+        with st.form("plan_add_form", clear_on_submit=True):
+            c1, c2 = st.columns([4, 1])
+            with c1:
+                plan_text = st.text_input("계획 추가(1회성)", placeholder="예: 독서 10분 / 이메일 정리", key="plan_text_input")
+            with c2:
+                submitted = st.form_submit_button("추가", use_container_width=True)
+            if submitted:
+                add_plan_task(selected, plan_text)
                 st.rerun()
 
-        # ---- Add habit (minimal)
-        with st.expander("습관 추가(반복)", expanded=False):
-            hc1, hc2 = st.columns([3, 2])
-            with hc1:
-                habit_title = st.text_input("습관 이름", placeholder="예: 운동 10분", key="habit_title")
-            with hc2:
-                dow_labels = [f"{korean_dow(i)}" for i in range(7)]
-                picked = st.multiselect("반복 요일", options=list(range(7)), format_func=lambda x: dow_labels[x], default=[0, 1, 2, 3, 4])
-            if st.button("습관 저장", use_container_width=True):
-                add_habit(habit_title, picked)
-                st.session_state["habit_title"] = ""
-                ensure_week_habit_tasks(ws)
-                st.success("습관을 저장했어요. 이번 주부터 자동으로 체크리스트에 떠요.")
-                st.rerun()
+        # -------- 습관 추가(오류 방지: form + clear_on_submit)
+        with st.expander("습관(반복) 관리", expanded=False):
+            with st.form("habit_add_form", clear_on_submit=True):
+                hc1, hc2 = st.columns([3, 2])
+                with hc1:
+                    habit_title = st.text_input("습관 이름", placeholder="예: 운동 10분", key="habit_title_input")
+                with hc2:
+                    dow_labels = [f"{korean_dow(i)}" for i in range(7)]
+                    picked = st.multiselect(
+                        "반복 요일", options=list(range(7)),
+                        format_func=lambda x: dow_labels[x],
+                        default=[0, 1, 2, 3, 4],
+                        key="habit_dow_input"
+                    )
+                habit_submit = st.form_submit_button("습관 저장", use_container_width=True)
 
-            # show active habits compact
+                if habit_submit:
+                    add_habit(habit_title, picked)
+                    ensure_week_habit_tasks(ws)
+                    st.success("습관을 저장했어요. 이번 주부터 체크리스트에 떠요.")
+                    st.rerun()
+
+            # habits list (ON/OFF/삭제)
             hdf = list_habits(active_only=False)
-            if not hdf.empty:
+            if hdf.empty:
+                st.markdown("<div class='small'>아직 습관이 없어요.</div>", unsafe_allow_html=True)
+            else:
                 st.markdown("<div class='small'>현재 습관</div>", unsafe_allow_html=True)
                 for _, h in hdf.iterrows():
-                    mask = str(h["dow_mask"])
-                    days_txt = "".join([korean_dow(i) if mask[i] == "1" else "" for i in range(7)])
-                    a, b = st.columns([5, 1])
+                    hid = int(h["id"])
+                    mask = str(h["dow_mask"] or "0000000")
+                    days_txt = " ".join([korean_dow(i) for i in range(7) if mask[i] == "1"]) or "—"
+                    active = int(h["active"]) == 1
+
+                    a, b, c = st.columns([6, 1, 1])
                     with a:
-                        st.write(f"• {h['title']}  ·  {days_txt if days_txt else '—'}")
+                        st.write(f"• {h['title']}  ·  {days_txt}")
                     with b:
-                        active = int(h["active"]) == 1
-                        if st.button("ON" if active else "OFF", key=f"hab_{h['id']}", use_container_width=True):
-                            set_habit_active(int(h["id"]), not active)
+                        if st.button("ON" if active else "OFF", key=f"hab_toggle_{hid}", use_container_width=True):
+                            set_habit_active(hid, not active)
                             ensure_week_habit_tasks(ws)
                             st.rerun()
+                    with c:
+                        if st.button("삭제", key=f"hab_del_{hid}", use_container_width=True):
+                            delete_habit(hid)
+                            st.success("습관을 삭제했어요.")
+                            st.rerun()
 
-        # ---- Task list
+        # ---- Task list (삭제 포함)
         df = list_tasks_for_date(selected)
         if df.empty:
-            st.markdown("<div class='small'>아직 항목이 없어요. 계획을 하나 추가하거나 습관을 만들어보세요.</div>", unsafe_allow_html=True)
+            st.markdown("<div class='small'>아직 항목이 없어요. 계획을 추가하거나 습관을 만들어보세요.</div>", unsafe_allow_html=True)
         else:
             for _, r in df.iterrows():
                 tid = int(r["id"])
@@ -759,10 +799,13 @@ def screen_planner():
                 icon_status = {"todo": "⏳", "success": "✅", "fail": "❌"}.get(status, "⏳")
 
                 st.markdown("<div class='task'>", unsafe_allow_html=True)
-                top = st.columns([6, 1.2, 1.2], gap="small")
+                top = st.columns([6, 1.2, 1.2, 1.0], gap="small")
 
                 with top[0]:
-                    st.markdown(f"**{icon_status} {text}**  <span class='pill pill-weak'>{icon_src}</span>", unsafe_allow_html=True)
+                    st.markdown(
+                        f"**{icon_status} {text}**  <span class='pill pill-weak'>{icon_src}</span>",
+                        unsafe_allow_html=True,
+                    )
                     if status == "fail":
                         st.caption(f"실패 원인: {reason}")
 
@@ -776,6 +819,12 @@ def screen_planner():
                     if st.button("실패", key=f"f_{tid}", use_container_width=True):
                         st.session_state[f"show_fail_{tid}"] = True
 
+                with top[3]:
+                    if st.button("삭제", key=f"del_{tid}", use_container_width=True):
+                        delete_task(tid)
+                        st.session_state.pop(f"show_fail_{tid}", None)
+                        st.rerun()
+
                 # fail editor
                 if st.session_state.get(f"show_fail_{tid}", False):
                     reason_in = st.text_input("실패 원인(한 문장)", value=reason, key=f"r_{tid}")
@@ -787,6 +836,7 @@ def screen_planner():
                             st.rerun()
                     with b:
                         st.caption("짧아도 좋아요. ‘무슨 조건 때문에’가 핵심이에요.")
+
                 st.markdown("</div>", unsafe_allow_html=True)
 
 
@@ -807,13 +857,13 @@ def screen_failures():
 
     nav = st.columns([1, 3, 1])
     with nav[0]:
-        if st.button("〈", use_container_width=True):
+        if st.button("〈", use_container_width=True, key="fw_prev"):
             st.session_state["fail_week_offset"] += 1
             st.rerun()
     with nav[1]:
         st.markdown(f"<div style='text-align:center; font-weight:650;'>{ws.isoformat()} ~ {we.isoformat()}</div>", unsafe_allow_html=True)
     with nav[2]:
-        if st.button("〉", use_container_width=True, disabled=(offset == 0)):
+        if st.button("〉", use_container_width=True, key="fw_next", disabled=(offset == 0)):
             st.session_state["fail_week_offset"] = max(0, offset - 1)
             st.rerun()
 
@@ -829,10 +879,11 @@ def screen_failures():
     st.markdown("<div class='card'>", unsafe_allow_html=True)
     st.markdown("### 주간 실패 차트")
     fails = df[df["status"] == "fail"].copy()
-    # counts per day
+
     day_counts = {d: 0 for d in week_days(ws)}
     for d, g in fails.groupby("task_date"):
         day_counts[d] = len(g)
+
     chart_df = pd.DataFrame({"date": list(day_counts.keys()), "fail_count": list(day_counts.values())})
     chart_df["label"] = chart_df["date"].apply(lambda d: f"{korean_dow(d.weekday())}\n{d.day}")
     st.bar_chart(chart_df.set_index("label")["fail_count"])
@@ -840,13 +891,12 @@ def screen_failures():
 
     st.write("")
 
-    # --- Weekly reason analysis (LLM)
-    st.markdown("<div class='card'>", unsafe_allow_html=True)
-    st.markdown("### 실패 원인 분석(주간)")
-
     api_key = effective_openai_key()
     model = get_setting("openai_model", "gpt-4o-mini")
 
+    # --- Weekly reason analysis (LLM)
+    st.markdown("<div class='card'>", unsafe_allow_html=True)
+    st.markdown("### 실패 원인 분석(주간)")
     weekly_reasons = [r for r in fails["fail_reason"].fillna("").tolist() if str(r).strip()]
 
     if not api_key:
@@ -854,7 +904,7 @@ def screen_failures():
     elif len(weekly_reasons) == 0:
         st.write("이번 주에는 실패 원인 입력이 아직 없어요. 실패 시 한 문장만 남겨도 분석이 좋아져요.")
     else:
-        if st.button("주간 분석 생성/갱신", use_container_width=True):
+        if st.button("주간 분석 생성/갱신", use_container_width=True, key="weekly_analyze"):
             try:
                 st.session_state["weekly_analysis"] = llm_weekly_reason_analysis(api_key, model, weekly_reasons)
             except Exception as e:
@@ -862,7 +912,7 @@ def screen_failures():
 
         analysis = st.session_state.get("weekly_analysis")
         if analysis and isinstance(analysis, dict):
-            groups = analysis.get("groups", [])
+            groups = analysis.get("groups", []) or []
             if not groups:
                 st.write("분석 결과가 비어 있어요. 이유를 조금 더 모은 뒤 다시 시도해보세요.")
             else:
@@ -875,7 +925,6 @@ def screen_failures():
                             st.caption("예시")
                             for s in ex[:3]:
                                 st.write(f"- {s}")
-
     st.markdown("</div>", unsafe_allow_html=True)
     st.write("")
 
@@ -894,30 +943,19 @@ def screen_failures():
         st.markdown("</div>", unsafe_allow_html=True)
         return
 
-    # repeated flags across all failures
-    flags = repeated_reason_flags(all_fail.rename(columns={"fail_reason": "fail_reason", "task_date": "task_date"}))
+    flags = repeated_reason_flags(all_fail)
 
-    # build coaching payload (recent sample)
     items: List[Dict[str, Any]] = []
     for _, r in all_fail.head(60).iterrows():
         reason = str(r["fail_reason"] or "")
         rnorm = normalize_reason(reason)
-        items.append(
-            {
-                "date": str(r["task_date"]),
-                "task": str(r["text"]),
-                "reason": reason,
-                "repeated_2w": bool(flags.get(rnorm, False)),
-            }
-        )
+        items.append({"date": str(r["task_date"]), "task": str(r["text"]), "reason": reason, "repeated_2w": bool(flags.get(rnorm, False))})
 
-    colA, colB = st.columns([1.2, 2.8])
-    with colA:
-        if st.button("코칭 생성/갱신", use_container_width=True):
-            try:
-                st.session_state["overall_coach"] = llm_overall_coaching(api_key, model, items)
-            except Exception as e:
-                st.error(f"코칭 생성 실패: {type(e).__name__}")
+    if st.button("코칭 생성/갱신", use_container_width=True, key="overall_coach_btn"):
+        try:
+            st.session_state["overall_coach"] = llm_overall_coaching(api_key, model, items)
+        except Exception as e:
+            st.error(f"코칭 생성 실패: {type(e).__name__}")
 
     coach = st.session_state.get("overall_coach")
     if coach and isinstance(coach, dict):
@@ -947,7 +985,6 @@ def screen_failures():
     if "chat_messages" not in st.session_state:
         st.session_state["chat_messages"] = []
 
-    # chat history render
     for m in st.session_state["chat_messages"]:
         with st.chat_message(m["role"]):
             st.write(m["content"])
@@ -958,8 +995,7 @@ def screen_failures():
         with st.chat_message("user"):
             st.write(user_msg)
 
-        # compact context for system
-        # quick stats: last 14 days fail reasons top
+        # lightweight context
         today = date.today()
         last14 = get_tasks_range(today - timedelta(days=13), today)
         last14_fail = last14[last14["status"] == "fail"]
@@ -980,8 +1016,6 @@ def screen_failures():
 사용자 데이터 요약:
 - 최근 14일 실패 이유 상위: {json.dumps(top_reasons, ensure_ascii=False)}
 - 누적 실패 샘플(최근 10개): {json.dumps(items[:10], ensure_ascii=False)}
-
-대화에서는 질문에 답하면서, 필요하면 '다음에 시도할 1가지 실험'을 제안해.
 """.strip()
 
         try:
@@ -997,7 +1031,7 @@ def screen_failures():
 
 
 # =========================
-# 상단 네비(2화면)
+# 네비(2화면)
 # =========================
 def top_nav():
     if "screen" not in st.session_state:
@@ -1005,12 +1039,11 @@ def top_nav():
 
     c1, c2, c3 = st.columns([1, 1, 6])
     with c1:
-        if st.button("📅 플래너", use_container_width=True):
+        if st.button("📅 플래너", use_container_width=True, key="nav_plan"):
             st.session_state["screen"] = "planner"
     with c2:
-        if st.button("⚠️ 실패", use_container_width=True):
+        if st.button("⚠️ 실패", use_container_width=True, key="nav_fail"):
             st.session_state["screen"] = "fail"
-
     st.write("")
     return st.session_state["screen"]
 
@@ -1028,13 +1061,11 @@ def main():
     st.write("")
 
     screen = top_nav()
-
     if screen == "planner":
         screen_planner()
     else:
         screen_failures()
 
-    # 하단 OpenAI 설정(요청사항)
     render_openai_bottom_panel()
 
 
