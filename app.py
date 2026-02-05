@@ -1,19 +1,21 @@
 # app.py
 # ------------------------------------------------------------
-# FAILOG
-# 실패를 성공으로! 계획과 습관의 실패를 기록하고 맞춤형 코칭을 받아보자
+# FAILOG (Device-separated, no-login)
+# ✅ Same device/browser: refresh/reopen keeps everything (user_id + data + OpenAI settings if saved)
+# ✅ Different device/browser: completely different app instance (different user_id)
 #
-# Key upgrades:
-# - device/browser-level user isolation (no login) via cookie-based user_id
-# - per-user SQLite partitioning + auto migration from old shared tables
-# - improved UI theme (#A0C4F2 + white), consistent spacing, button hierarchy
-# - weekly fail chart Mon..Sun order + smaller height
-# - deeper personalized coaching prompt using 28-day signals + repeated>=14d creative alternatives forced
-# - reminder uses Asia/Seoul time; optional auto-refresh if streamlit-autorefresh installed
+# Key fix:
+# - localStorage read is sometimes available only after 1 extra render.
+#   We implement ls_get_stable() that auto-reruns ONCE per key to stabilize.
+# - user_id comes from localStorage (source of truth), not cookies/session.
+# - OpenAI settings persist in localStorage when "로컬 저장" ON.
+# - Data persists in SQLite + also snapshot into localStorage as backup (so even if server resets, device restores).
+#
+# Install:
+#   pip install streamlit pandas altair openai streamlit-local-storage
+#   (optional) pip install streamlit-autorefresh
 #
 # Run:
-#   pip install streamlit pandas openai altair extra-streamlit-components
-#   (optional) pip install streamlit-autorefresh
 #   streamlit run app.py
 # ------------------------------------------------------------
 
@@ -22,16 +24,16 @@ import re
 import sqlite3
 import uuid
 from datetime import date, datetime, timedelta, time
-from typing import Optional, List, Dict, Any, Tuple
+from typing import Optional, List, Dict, Any
 
 import pandas as pd
 import streamlit as st
 import altair as alt
+from zoneinfo import ZoneInfo
 
-# Cookie manager
-import extra_streamlit_components as stx
+from streamlit_local_storage import LocalStorage  # pip install streamlit-local-storage
 
-# Optional autorefresh
+# Optional autorefresh (helps reminder + periodic UI updates)
 try:
     from streamlit_autorefresh import st_autorefresh
 except Exception:
@@ -43,44 +45,30 @@ try:
 except Exception:
     OpenAI = None
 
-# Timezone (Python 3.9+)
-from zoneinfo import ZoneInfo
-
 KST = ZoneInfo("Asia/Seoul")
-ACCENT = "#A0C4F2"
 DB_PATH = "planner.db"
+ACCENT = "#A0C4F2"
 
-
-# =========================
-# THEME / CSS (서비스 느낌)
-# =========================
+# -------------------------
+# UI / CSS
+# -------------------------
 def inject_css():
     st.markdown(
         f"""
 <style>
-/* Page canvas */
 .block-container {{
   max-width: 1120px;
   padding-top: 1.0rem;
   padding-bottom: 2.2rem;
 }}
-
-/* Soft background */
 [data-testid="stAppViewContainer"] {{
   background: radial-gradient(1200px 420px at 30% 0%, rgba(160,196,242,0.28), rgba(255,255,255,0) 60%),
               linear-gradient(180deg, rgba(160,196,242,0.18) 0%, rgba(255,255,255,1) 55%);
-}}
-
-/* Typography */
-h1,h2,h3 {{
-  letter-spacing: -0.02em;
 }}
 .small {{
   color: rgba(31,36,48,0.65);
   font-size: 0.92rem;
 }}
-
-/* Cards */
 .card {{
   border: 1px solid rgba(160,196,242,0.58);
   border-radius: 18px;
@@ -88,14 +76,14 @@ h1,h2,h3 {{
   background: rgba(255,255,255,0.94);
   box-shadow: 0 10px 26px rgba(160,196,242,0.14);
 }}
-.card-tight {{
-  border: 1px solid rgba(160,196,242,0.45);
+.task {{
+  border: 1px solid rgba(160,196,242,0.46);
   border-radius: 16px;
-  padding: 12px 12px;
-  background: rgba(255,255,255,0.93);
+  padding: 10px 10px;
+  background: rgba(255,255,255,0.95);
 }}
+.task + .task {{ margin-top: 8px; }}
 
-/* Pills / badges */
 .pill {{
   display:inline-flex;
   align-items:center;
@@ -112,39 +100,16 @@ h1,h2,h3 {{
   border-color: rgba(160,196,242,0.88);
   color: rgba(31,36,48,0.90);
 }}
-.pill-muted {{
-  background: rgba(255,255,255,0.88);
-  border-color: rgba(160,196,242,0.42);
+div[data-testid="stButton"] > button {{
+  border-radius: 14px !important;
+  white-space: nowrap !important;
 }}
-
-/* Task item */
-.task {{
-  border: 1px solid rgba(160,196,242,0.46);
-  border-radius: 16px;
-  padding: 10px 10px;
-  background: rgba(255,255,255,0.95);
-}}
-.task + .task {{
-  margin-top: 8px;
-}}
-
-/* Reduce default widget heaviness */
 [data-testid="stTextInput"] input,
 [data-testid="stTextArea"] textarea {{
   border-radius: 14px !important;
   border: 1px solid rgba(160,196,242,0.55) !important;
 }}
-[data-testid="stMultiSelect"] div {{
-  border-radius: 14px !important;
-}}
-
-/* Buttons */
-div[data-testid="stButton"] > button {{
-  border-radius: 14px !important;
-  white-space: nowrap !important;
-}}
-
-/* Month calendar button compact + prevent two-digit wrapping */
+/* Month: keep 2-digit day in one line */
 .month-grid div[data-testid="stButton"] > button {{
   font-size: 0.82rem !important;
   padding: 0.10rem 0.18rem !important;
@@ -152,8 +117,6 @@ div[data-testid="stButton"] > button {{
   min-height: 30px !important;
   white-space: nowrap !important;
 }}
-
-/* Subtle section dividers */
 hr {{
   margin: 1.1rem 0;
   border: none;
@@ -164,45 +127,63 @@ hr {{
         unsafe_allow_html=True,
     )
 
+# -------------------------
+# LocalStorage stable access
+# -------------------------
+def ls() -> LocalStorage:
+    if "ls_obj" not in st.session_state:
+        st.session_state["ls_obj"] = LocalStorage()
+    return st.session_state["ls_obj"]
 
-# =========================
-# USER ID (cookie-based)
-# =========================
-from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
-import uuid
-import extra_streamlit_components as stx
-import streamlit as st
+def ls_set(item_key: str, value: str):
+    ls().setItem(item_key, value if value is not None else "")
 
-KST = ZoneInfo("Asia/Seoul")
+def ls_get_stable(item_key: str, state_key: str, allow_one_rerun: bool = True) -> Optional[str]:
+    """
+    streamlit-local-storage often needs 2 renders to populate session_state.
+    We auto-rerun ONCE per key if value is missing.
+    """
+    try:
+        _ = ls().getItem(item_key, key=state_key)
+    except TypeError:
+        _ = ls().getItem(item_key)
 
+    val = st.session_state.get(state_key, None)
+
+    missing = (val is None) or (isinstance(val, str) and val.strip() == "")
+    if missing and allow_one_rerun:
+        flag = f"__ls_retry__{item_key}"
+        if not st.session_state.get(flag, False):
+            st.session_state[flag] = True
+            st.rerun()
+
+    if isinstance(val, str):
+        v = val.strip()
+        return v if v else None
+    return None
+
+# -------------------------
+# Stable device user_id
+# -------------------------
 def get_or_create_user_id() -> str:
-    # 1) 같은 세션(리런 포함)에서는 절대 흔들리지 않게
+    # session stable during reruns
     if st.session_state.get("user_id"):
         return st.session_state["user_id"]
 
-    cookie = stx.CookieManager()
-    uid = cookie.get("failog_uid")
-
-    # 2) 쿠키가 있으면 세션에 고정
+    uid = ls_get_stable("failog_uid", "ls_uid", allow_one_rerun=True)
     if uid:
         st.session_state["user_id"] = uid
         return uid
 
-    # 3) 없으면 새로 만들고 -> 세션에 고정 -> 쿠키에 "장기 만료"로 저장
-    uid = str(uuid.uuid4())
-    st.session_state["user_id"] = uid
-
-    expires = datetime.now(KST) + timedelta(days=3650)  # 약 10년
-    cookie.set("failog_uid", uid, expires_at=expires)
-
-    # 4) 쿠키가 다음 런에서 확실히 잡히도록 1회 리런
+    # create
+    new_uid = str(uuid.uuid4())
+    st.session_state["user_id"] = new_uid
+    ls_set("failog_uid", new_uid)
     st.rerun()
 
-
-# =========================
-# DB helpers
-# =========================
+# -------------------------
+# DB
+# -------------------------
 def conn():
     c = sqlite3.connect(DB_PATH, check_same_thread=False)
     c.execute("PRAGMA foreign_keys = ON;")
@@ -211,41 +192,25 @@ def conn():
 def now_iso() -> str:
     return datetime.now(KST).isoformat(timespec="seconds")
 
-def table_has_column(c: sqlite3.Connection, table: str, col: str) -> bool:
-    rows = c.execute(f"PRAGMA table_info({table});").fetchall()
-    return any(r[1] == col for r in rows)
-
-def table_exists(c: sqlite3.Connection, table: str) -> bool:
-    row = c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?;", (table,)).fetchone()
-    return bool(row)
-
-def init_db_and_migrate_if_needed():
-    """
-    목표 스키마:
-      tasks(user_id,..., UNIQUE(user_id, task_date, source, habit_id, text))
-      habits(user_id,...)
-      settings(user_id,key,value, UNIQUE(user_id,key))
-    기존 스키마(공유 DB)가 있으면 자동으로 v2로 마이그레이션하고 old table은 backup으로 rename.
-    """
+def init_db():
     c = conn()
     cur = c.cursor()
-
-    # If new tables already exist, done.
-    if table_exists(c, "tasks") and table_has_column(c, "tasks", "user_id") and \
-       table_exists(c, "habits") and table_has_column(c, "habits", "user_id") and \
-       table_exists(c, "settings") and table_has_column(c, "settings", "user_id"):
-        c.close()
-        return
-
-    # If old tables exist without user_id, migrate.
-    # We'll create new tables tasks_v2/habits_v2/settings_v2, copy data with user_id='shared',
-    # then rename.
-    shared_uid = "shared"
-
-    # Create v2 tables
     cur.execute(
         """
-        CREATE TABLE IF NOT EXISTS tasks_v2 (
+        CREATE TABLE IF NOT EXISTS habits (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          user_id TEXT NOT NULL,
+          title TEXT NOT NULL,
+          dow_mask TEXT NOT NULL,
+          active INTEGER NOT NULL DEFAULT 1,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS tasks (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           user_id TEXT NOT NULL,
           task_date TEXT NOT NULL,
@@ -260,172 +225,114 @@ def init_db_and_migrate_if_needed():
         );
         """
     )
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS habits_v2 (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          user_id TEXT NOT NULL,
-          title TEXT NOT NULL,
-          dow_mask TEXT NOT NULL,
-          active INTEGER NOT NULL DEFAULT 1,
-          created_at TEXT NOT NULL,
-          updated_at TEXT NOT NULL
-        );
-        """
-    )
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS settings_v2 (
-          user_id TEXT NOT NULL,
-          key TEXT NOT NULL,
-          value TEXT NOT NULL,
-          updated_at TEXT NOT NULL,
-          PRIMARY KEY (user_id, key)
-        );
-        """
-    )
-
-    # Copy from old tasks if exist
-    if table_exists(c, "tasks"):
-        if table_has_column(c, "tasks", "user_id"):
-            # Already v2-like, copy to tasks_v2 just in case
-            cur.execute(
-                """
-                INSERT OR IGNORE INTO tasks_v2
-                (id, user_id, task_date, text, source, habit_id, status, fail_reason, created_at, updated_at)
-                SELECT id, user_id, task_date, text, source, habit_id, status, fail_reason, created_at, updated_at
-                FROM tasks;
-                """
-            )
-        else:
-            cur.execute(
-                """
-                INSERT OR IGNORE INTO tasks_v2
-                (user_id, task_date, text, source, habit_id, status, fail_reason, created_at, updated_at)
-                SELECT ?, task_date, text, source, habit_id, status, fail_reason, created_at, updated_at
-                FROM tasks;
-                """,
-                (shared_uid,),
-            )
-
-    # Copy from old habits if exist
-    if table_exists(c, "habits"):
-        if table_has_column(c, "habits", "user_id"):
-            cur.execute(
-                """
-                INSERT OR IGNORE INTO habits_v2
-                (id, user_id, title, dow_mask, active, created_at, updated_at)
-                SELECT id, user_id, title, dow_mask, active, created_at, updated_at
-                FROM habits;
-                """
-            )
-        else:
-            cur.execute(
-                """
-                INSERT OR IGNORE INTO habits_v2
-                (user_id, title, dow_mask, active, created_at, updated_at)
-                SELECT ?, title, dow_mask, active, created_at, updated_at
-                FROM habits;
-                """,
-                (shared_uid,),
-            )
-
-    # Copy from old settings if exist
-    if table_exists(c, "settings"):
-        if table_has_column(c, "settings", "user_id"):
-            cur.execute(
-                """
-                INSERT OR IGNORE INTO settings_v2
-                (user_id, key, value, updated_at)
-                SELECT user_id, key, value, updated_at
-                FROM settings;
-                """
-            )
-        else:
-            cur.execute(
-                """
-                INSERT OR IGNORE INTO settings_v2
-                (user_id, key, value, updated_at)
-                SELECT ?, key, value, updated_at
-                FROM settings;
-                """,
-                (shared_uid,),
-            )
-
-    c.commit()
-
-    # Backup old tables then promote v2
-    def safe_rename(old: str, new: str):
-        if table_exists(c, old):
-            cur.execute(f"ALTER TABLE {old} RENAME TO {new};")
-
-    safe_rename("tasks", "tasks_backup")
-    safe_rename("habits", "habits_backup")
-    safe_rename("settings", "settings_backup")
-
-    cur.execute("ALTER TABLE tasks_v2 RENAME TO tasks;")
-    cur.execute("ALTER TABLE habits_v2 RENAME TO habits;")
-    cur.execute("ALTER TABLE settings_v2 RENAME TO settings;")
-
     c.commit()
     c.close()
 
+# -------------------------
+# Snapshot backup in localStorage
+# -------------------------
+def snapshot_key(user_id: str) -> str:
+    return f"failog_snapshot_{user_id}"
 
-# =========================
-# Settings (per user)
-# =========================
-DEFAULT_SETTINGS = {
-    "openai_api_key": "",
-    "openai_model": "gpt-4o-mini",
-    "reminder_enabled": "true",
-    "reminder_time": "21:30",
-    "reminder_window_min": "15",
-    "reminder_autorefresh": "true",  # optional
-    "reminder_autorefresh_sec": "60",
-}
+def export_user_data(user_id: str) -> Dict[str, Any]:
+    c = conn()
+    habits = pd.read_sql_query(
+        "SELECT id,title,dow_mask,active,created_at,updated_at FROM habits WHERE user_id=? ORDER BY id ASC",
+        c,
+        params=(user_id,),
+    )
+    tasks = pd.read_sql_query(
+        "SELECT id,task_date,text,source,habit_id,status,fail_reason,created_at,updated_at FROM tasks WHERE user_id=? ORDER BY id ASC",
+        c,
+        params=(user_id,),
+    )
+    c.close()
+    return {
+        "version": 1,
+        "exported_at": now_iso(),
+        "habits": habits.to_dict(orient="records"),
+        "tasks": tasks.to_dict(orient="records"),
+    }
 
-def ensure_user_settings(user_id: str):
+def save_snapshot(user_id: str):
+    try:
+        data = export_user_data(user_id)
+        ls_set(snapshot_key(user_id), json.dumps(data, ensure_ascii=False))
+    except Exception:
+        pass
+
+def restore_from_snapshot_if_needed(user_id: str):
+    c = conn()
+    row = c.execute("SELECT COUNT(*) FROM tasks WHERE user_id=?", (user_id,)).fetchone()
+    cnt = int(row[0] if row else 0)
+    c.close()
+    if cnt > 0:
+        return
+
+    snap = ls_get_stable(snapshot_key(user_id), "ls_snap", allow_one_rerun=True)
+    if not snap:
+        return
+
+    try:
+        data = json.loads(snap)
+    except Exception:
+        return
+
+    habits = data.get("habits", []) or []
+    tasks = data.get("tasks", []) or []
+
     c = conn()
     cur = c.cursor()
-    for k, v in DEFAULT_SETTINGS.items():
-        cur.execute(
-            """
-            INSERT OR IGNORE INTO settings(user_id, key, value, updated_at)
-            VALUES (?,?,?,?)
-            """,
-            (user_id, k, v, now_iso()),
-        )
+
+    for h in habits:
+        try:
+            cur.execute(
+                """
+                INSERT OR IGNORE INTO habits(id,user_id,title,dow_mask,active,created_at,updated_at)
+                VALUES (?,?,?,?,?,?,?)
+                """,
+                (
+                    int(h["id"]),
+                    user_id,
+                    str(h["title"]),
+                    str(h["dow_mask"]),
+                    int(h.get("active", 1)),
+                    str(h.get("created_at", now_iso())),
+                    str(h.get("updated_at", now_iso())),
+                ),
+            )
+        except Exception:
+            pass
+
+    for t in tasks:
+        try:
+            cur.execute(
+                """
+                INSERT OR IGNORE INTO tasks(id,user_id,task_date,text,source,habit_id,status,fail_reason,created_at,updated_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    int(t["id"]),
+                    user_id,
+                    str(t["task_date"]),
+                    str(t["text"]),
+                    str(t["source"]),
+                    t.get("habit_id", None),
+                    str(t.get("status", "todo")),
+                    t.get("fail_reason", None),
+                    str(t.get("created_at", now_iso())),
+                    str(t.get("updated_at", now_iso())),
+                ),
+            )
+        except Exception:
+            pass
+
     c.commit()
     c.close()
 
-def get_setting(user_id: str, key: str, default: str = "") -> str:
-    c = conn()
-    row = c.execute(
-        "SELECT value FROM settings WHERE user_id=? AND key=?",
-        (user_id, key),
-    ).fetchone()
-    c.close()
-    return row[0] if row else default
-
-def set_setting(user_id: str, key: str, value: str):
-    c = conn()
-    c.execute(
-        """
-        INSERT INTO settings(user_id, key, value, updated_at)
-        VALUES (?,?,?,?)
-        ON CONFLICT(user_id, key) DO UPDATE SET
-          value=excluded.value,
-          updated_at=excluded.updated_at
-        """,
-        (user_id, key, value, now_iso()),
-    )
-    c.commit()
-    c.close()
-
-
-# =========================
+# -------------------------
 # Date helpers (Mon-Sun)
-# =========================
+# -------------------------
 def week_start(d: date) -> date:
     return d - timedelta(days=d.weekday())
 
@@ -443,9 +350,9 @@ def month_grid(year: int, month: int) -> List[List[Optional[date]]]:
 
     grid: List[List[Optional[date]]] = []
     row: List[Optional[date]] = [None] * 7
-
     day = 1
     idx = first_wd
+
     while day <= last.day:
         row[idx] = date(year, month, day)
         day += 1
@@ -454,14 +361,14 @@ def month_grid(year: int, month: int) -> List[List[Optional[date]]]:
             grid.append(row)
             row = [None] * 7
             idx = 0
+
     if any(x is not None for x in row):
         grid.append(row)
     return grid
 
-
-# =========================
-# Habits / Tasks (per user)
-# =========================
+# -------------------------
+# Habits / Tasks
+# -------------------------
 def list_habits(user_id: str, active_only: bool = True) -> pd.DataFrame:
     c = conn()
     q = "SELECT id, title, dow_mask, active FROM habits WHERE user_id=?"
@@ -493,6 +400,7 @@ def add_habit(user_id: str, title: str, dows: List[int]):
     )
     c.commit()
     c.close()
+    save_snapshot(user_id)
 
 def set_habit_active(user_id: str, habit_id: int, active: bool):
     c = conn()
@@ -502,12 +410,13 @@ def set_habit_active(user_id: str, habit_id: int, active: bool):
     )
     c.commit()
     c.close()
+    save_snapshot(user_id)
 
 def delete_habit(user_id: str, habit_id: int):
     today = date.today().isoformat()
     c = conn()
     cur = c.cursor()
-    # keep past success/fail for coaching; clean future/ongoing todo from this habit
+    # remove future todo tasks of that habit
     cur.execute(
         """
         DELETE FROM tasks
@@ -518,13 +427,14 @@ def delete_habit(user_id: str, habit_id: int):
     cur.execute("DELETE FROM habits WHERE user_id=? AND id=?", (user_id, habit_id))
     c.commit()
     c.close()
+    save_snapshot(user_id)
 
 def ensure_week_habit_tasks(user_id: str, ws: date):
     habits = list_habits(user_id, active_only=True)
     if habits.empty:
         return
-    days = week_days(ws)
 
+    days = week_days(ws)
     c = conn()
     cur = c.cursor()
     for _, h in habits.iterrows():
@@ -543,6 +453,7 @@ def ensure_week_habit_tasks(user_id: str, ws: date):
                 )
     c.commit()
     c.close()
+    save_snapshot(user_id)
 
 def add_plan_task(user_id: str, d: date, text: str):
     text = (text or "").strip()
@@ -559,12 +470,14 @@ def add_plan_task(user_id: str, d: date, text: str):
     )
     c.commit()
     c.close()
+    save_snapshot(user_id)
 
 def delete_task(user_id: str, task_id: int):
     c = conn()
     c.execute("DELETE FROM tasks WHERE user_id=? AND id=?", (user_id, task_id))
     c.commit()
     c.close()
+    save_snapshot(user_id)
 
 def list_tasks_for_date(user_id: str, d: date) -> pd.DataFrame:
     c = conn()
@@ -594,16 +507,18 @@ def update_task_status(user_id: str, task_id: int, status: str):
         )
     c.commit()
     c.close()
+    save_snapshot(user_id)
 
 def update_task_fail(user_id: str, task_id: int, reason: str):
-    reason = (reason or "").strip()
+    reason = (reason or "").strip() or "이유 미기록"
     c = conn()
     c.execute(
         "UPDATE tasks SET status='fail', fail_reason=?, updated_at=? WHERE user_id=? AND id=?",
-        (reason if reason else "이유 미기록", now_iso(), user_id, task_id),
+        (reason, now_iso(), user_id, task_id),
     )
     c.commit()
     c.close()
+    save_snapshot(user_id)
 
 def get_tasks_range(user_id: str, start_d: date, end_d: date) -> pd.DataFrame:
     c = conn()
@@ -646,10 +561,9 @@ def count_today_todos(user_id: str) -> int:
     c.close()
     return int(row[0] if row else 0)
 
-
-# =========================
-# Reminder
-# =========================
+# -------------------------
+# Reminder (localStorage-backed)
+# -------------------------
 def parse_hhmm(s: str) -> time:
     s = (s or "").strip()
     m = re.match(r"^(\d{1,2}):(\d{2})$", s)
@@ -665,17 +579,9 @@ def should_remind(now_dt: datetime, remind_t: time, window_min: int) -> bool:
     delta_min = abs((now_dt - target).total_seconds()) / 60.0
     return delta_min <= float(window_min)
 
-
-# =========================
-# OpenAI
-# =========================
-def effective_openai_key(user_id: str) -> str:
-    # session override first
-    sk = st.session_state.get("openai_api_key", "")
-    if sk.strip():
-        return sk.strip()
-    return get_setting(user_id, "openai_api_key", "").strip()
-
+# -------------------------
+# OpenAI localStorage-backed
+# -------------------------
 def openai_client(api_key: str):
     if OpenAI is None:
         raise RuntimeError("openai 패키지가 설치되지 않았어요. pip install openai")
@@ -683,36 +589,27 @@ def openai_client(api_key: str):
         raise RuntimeError("OpenAI API Key가 비어 있어요.")
     return OpenAI(api_key=api_key.strip())
 
+def ls_openai_key() -> str:
+    return ls_get_stable("failog_openai_key", "ls_openai_key", allow_one_rerun=True) or ""
 
-# =========================
-# Repeated failure detection (>=14 days)
-# =========================
-def normalize_reason(text: str) -> str:
-    t = (text or "").strip().lower()
-    t = re.sub(r"\s+", " ", t)
-    t = re.sub(r"[^\w\s가-힣]", "", t)
-    return t
+def ls_openai_model() -> str:
+    return ls_get_stable("failog_openai_model", "ls_openai_model", allow_one_rerun=True) or "gpt-4o-mini"
 
-def repeated_reason_flags(df_fail: pd.DataFrame) -> Dict[str, bool]:
-    if df_fail.empty:
-        return {}
-    x = df_fail.copy()
-    x["task_date"] = pd.to_datetime(x["task_date"]).dt.date
-    x["rnorm"] = x["fail_reason"].fillna("").map(normalize_reason)
+def effective_openai_key() -> str:
+    sk = st.session_state.get("openai_api_key", "")
+    return sk.strip() if sk and sk.strip() else ls_openai_key().strip()
 
-    flags: Dict[str, bool] = {}
-    for rnorm, g in x.groupby("rnorm"):
-        if not rnorm:
-            continue
-        dates = sorted(g["task_date"].tolist())
-        if len(dates) >= 2 and (dates[-1] - dates[0]).days >= 14:
-            flags[rnorm] = True
-    return flags
+def effective_openai_model() -> str:
+    sm = st.session_state.get("openai_model", "")
+    return sm.strip() if sm and sm.strip() else ls_openai_model().strip()
 
+def set_ls_openai(api_key: str, model: str):
+    ls_set("failog_openai_key", (api_key or "").strip())
+    ls_set("failog_openai_model", (model or "gpt-4o-mini").strip())
 
-# =========================
-# Coaching prompts (deeper personalization)
-# =========================
+# -------------------------
+# Coaching prompt (your requirement)
+# -------------------------
 BASE_COACH_PROMPT = (
     "사용자의 계획 실패 이유 목록을 분석해 공통 원인을 3가지 이내로 분류하고, "
     "각 원인에 대해 실행 가능하고 현실적인 개선 조언을 제시해줘. "
@@ -743,11 +640,31 @@ COACH_SCHEMA = """
 규칙:
 - top_causes 최대 3개
 - summary/advice는 반드시 '사용자 데이터'의 구체 요소를 최소 2개 이상 언급
-  (예: 특정 습관/계획 이름, 실패가 몰리는 요일, 사용자 실패 이유 표현 일부, 연속 실패 구간 등)
 - actionable_advice는 '작고 구체적' (환경/시간/트리거/대체행동/장애물 대비 포함)
 - 비난/자책 유도 금지, 코칭 톤
 - repeated_2w=true 항목이 하나라도 있으면 해당 원인에는 creative_advice_when_repeated_2w를 반드시 채워라(빈 배열 금지)
 """
+
+def normalize_reason(text: str) -> str:
+    t = (text or "").strip().lower()
+    t = re.sub(r"\s+", " ", t)
+    t = re.sub(r"[^\w\s가-힣]", "", t)
+    return t
+
+def repeated_reason_flags(df_fail: pd.DataFrame) -> Dict[str, bool]:
+    if df_fail.empty:
+        return {}
+    x = df_fail.copy()
+    x["task_date"] = pd.to_datetime(x["task_date"]).dt.date
+    x["rnorm"] = x["fail_reason"].fillna("").map(normalize_reason)
+    flags: Dict[str, bool] = {}
+    for rnorm, g in x.groupby("rnorm"):
+        if not rnorm:
+            continue
+        dates = sorted(g["task_date"].tolist())
+        if len(dates) >= 2 and (dates[-1] - dates[0]).days >= 14:
+            flags[rnorm] = True
+    return flags
 
 def compute_user_signals(user_id: str, days: int = 28) -> Dict[str, Any]:
     end = date.today()
@@ -762,17 +679,16 @@ def compute_user_signals(user_id: str, days: int = 28) -> Dict[str, Any]:
     df["is_fail"] = df["status"].eq("fail")
     df["is_success"] = df["status"].eq("success")
 
-    total = len(df)
-    fail = int(df["is_fail"].sum())
-    succ = int(df["is_success"].sum())
-    todo = int((df["status"] == "todo").sum())
+    fail_by_dow = (
+        df[df["is_fail"]]
+        .groupby("dow")["is_fail"]
+        .sum()
+        .reindex(range(7), fill_value=0)
+        .to_dict()
+    )
+    fail_by_dow = {korean_dow(int(k)): int(v) for k, v in fail_by_dow.items()}
 
-    by_source = df.groupby("source")["status"].value_counts().unstack(fill_value=0).to_dict()
-
-    dow_fail = df[df["is_fail"]].groupby("dow")["is_fail"].sum().reindex(range(7), fill_value=0).to_dict()
-    fail_by_dow = {korean_dow(int(k)): int(v) for k, v in dow_fail.items()}
-
-    top_failed_items_df = (
+    top_failed = (
         df[df["is_fail"]]
         .groupby(["text", "source"])["is_fail"]
         .sum()
@@ -782,40 +698,27 @@ def compute_user_signals(user_id: str, days: int = 28) -> Dict[str, Any]:
     )
     top_failed_items = [
         {"item": r["text"], "type": r["source"], "fail_count": int(r["is_fail"])}
-        for _, r in top_failed_items_df.iterrows()
+        for _, r in top_failed.iterrows()
     ]
 
     reasons = df[df["is_fail"]]["fail_reason"].fillna("").map(lambda s: s.strip())
     top_reasons = reasons[reasons != ""].value_counts().head(10).to_dict()
-
-    # Longest streak of consecutive days with >=1 failure
-    fails_by_day = df[df["is_fail"]].groupby("task_date")["is_fail"].sum()
-    fail_days = sorted(fails_by_day.index.tolist())
-    longest = 0
-    current = 0
-    prev = None
-    for d in fail_days:
-        if prev is None or (d - prev).days == 1:
-            current += 1
-        else:
-            longest = max(longest, current)
-            current = 1
-        prev = d
-    longest = max(longest, current) if fail_days else 0
 
     return {
         "has_data": True,
         "window_days": days,
         "window_start": start.isoformat(),
         "window_end": end.isoformat(),
-        "counts": {"total": total, "success": succ, "fail": fail, "todo": todo},
+        "counts": {
+            "total": int(len(df)),
+            "success": int(df["is_success"].sum()),
+            "fail": int(df["is_fail"].sum()),
+            "todo": int((df["status"] == "todo").sum()),
+        },
         "fail_by_dow": fail_by_dow,
-        "by_source": by_source,
         "top_failed_items": top_failed_items,
         "top_reasons": top_reasons,
-        "longest_fail_streak_days": int(longest),
     }
-
 
 def llm_weekly_reason_analysis(api_key: str, model: str, reasons: List[str]) -> Dict[str, Any]:
     client = openai_client(api_key)
@@ -850,7 +753,6 @@ def llm_weekly_reason_analysis(api_key: str, model: str, reasons: List[str]) -> 
     except json.JSONDecodeError:
         m = re.search(r"\{.*\}", text, flags=re.DOTALL)
         return json.loads(m.group(0)) if m else {"groups": []}
-
 
 def llm_overall_coaching(api_key: str, model: str, fail_items: List[Dict[str, Any]], signals: Dict[str, Any]) -> Dict[str, Any]:
     client = openai_client(api_key)
@@ -890,7 +792,6 @@ def llm_overall_coaching(api_key: str, model: str, fail_items: List[Dict[str, An
         m = re.search(r"\{.*\}", text, flags=re.DOTALL)
         return json.loads(m.group(0)) if m else {"top_causes": []}
 
-
 def llm_chat(api_key: str, model: str, system_context: str, msgs: List[Dict[str, str]]) -> str:
     client = openai_client(api_key)
     resp = client.chat.completions.create(
@@ -900,45 +801,15 @@ def llm_chat(api_key: str, model: str, system_context: str, msgs: List[Dict[str,
     )
     return (resp.choices[0].message.content or "").strip()
 
-
-# =========================
-# UI: Bottom OpenAI panel (per user)
-# =========================
-def render_openai_bottom_panel(user_id: str):
-    st.markdown("<hr/>", unsafe_allow_html=True)
-    st.markdown("### 🔑 OpenAI 설정")
-
-    col1, col2, col3 = st.columns([3.0, 1.6, 1.4])
-    with col1:
-        api_key = st.text_input(
-            "OpenAI API Key",
-            value=st.session_state.get("openai_api_key", ""),
-            type="password",
-            placeholder="sk-...",
-            key="bottom_openai_key",
-        )
-    with col2:
-        model = st.text_input("모델", value=get_setting(user_id, "openai_model", "gpt-4o-mini"), key="bottom_openai_model")
-    with col3:
-        save = st.toggle("로컬 저장", value=False, help="공용 PC면 끄는 걸 추천", key="bottom_openai_save")
-
-    a, b = st.columns([1, 4])
-    with a:
-        if st.button("적용", use_container_width=True, key="bottom_apply"):
-            st.session_state["openai_api_key"] = api_key.strip()
-            set_setting(user_id, "openai_model", (model.strip() or "gpt-4o-mini"))
-            if save:
-                set_setting(user_id, "openai_api_key", api_key.strip())
-            st.success("적용됐어요.")
-    with b:
-        st.caption("키가 없으면 원인 분석/코칭/챗봇이 동작하지 않아요.")
-
-
-# =========================
-# Screen: Planner
-# =========================
+# -------------------------
+# Screens
+# -------------------------
 def screen_planner(user_id: str):
     st.markdown("## Planner")
+
+    # Optional periodic refresh (helps reminder show even if user stays on page)
+    if st_autorefresh is not None:
+        st_autorefresh(interval=60_000, key="auto_refresh_planner")
 
     if "selected_date" not in st.session_state:
         st.session_state["selected_date"] = date.today()
@@ -948,25 +819,23 @@ def screen_planner(user_id: str):
 
     ensure_week_habit_tasks(user_id, ws)
 
-    # Optional autorefresh to make reminder reliable
-    if st_autorefresh is not None:
-        if get_setting(user_id, "reminder_autorefresh", "true").lower() == "true":
-            sec = int(get_setting(user_id, "reminder_autorefresh_sec", "60"))
-            st_autorefresh(interval=sec * 1000, key="planner_refresh")
+    # Reminder settings in localStorage
+    en = (ls_get_stable("failog_reminder_enabled", "ls_rem_en", allow_one_rerun=True) or "true").lower() == "true"
+    rt_str = ls_get_stable("failog_reminder_time", "ls_rem_time", allow_one_rerun=True) or "21:30"
+    win_str = ls_get_stable("failog_reminder_win", "ls_rem_win", allow_one_rerun=True) or "15"
+    remind_t = parse_hhmm(rt_str)
+    try:
+        win = int(win_str)
+    except Exception:
+        win = 15
 
-    # Reminder (KST)
-    if get_setting(user_id, "reminder_enabled", "true").lower() == "true":
-        rt = parse_hhmm(get_setting(user_id, "reminder_time", "21:30"))
-        win = int(get_setting(user_id, "reminder_window_min", "15"))
-        now_dt = datetime.now(KST)
-        if should_remind(now_dt, rt, win):
-            todos = count_today_todos(user_id)
-            if todos > 0:
-                st.toast(f"⏰ 아직 체크하지 않은 항목이 {todos}개 있어요", icon="⏰")
+    if en and should_remind(datetime.now(KST), remind_t, win):
+        todos = count_today_todos(user_id)
+        if todos > 0:
+            st.toast(f"⏰ 아직 체크하지 않은 항목이 {todos}개 있어요", icon="⏰")
 
     left, right = st.columns([1.05, 1.95], gap="large")
 
-    # Month card
     with left:
         st.markdown("<div class='card month-grid'>", unsafe_allow_html=True)
         st.markdown("### Month")
@@ -1012,12 +881,9 @@ def screen_planner(user_id: str):
                 if d is None:
                     cols[i].markdown("<div style='height:30px;'></div>", unsafe_allow_html=True)
                     continue
-
                 label = f"{d.day}"
                 if d == today:
                     label = f"•{d.day}"
-
-                # make selected date a bit highlighted by using emoji dot kept minimal
                 if cols[i].button(label, key=f"cal_{d.isoformat()}", use_container_width=True):
                     st.session_state["selected_date"] = d
                     st.rerun()
@@ -1025,38 +891,25 @@ def screen_planner(user_id: str):
         st.markdown("</div>", unsafe_allow_html=True)
 
         with st.expander("알림 설정", expanded=False):
-            en = st.toggle("리마인더 켜기", value=get_setting(user_id, "reminder_enabled", "true").lower() == "true", key="rem_en")
-            t = st.text_input("시간(HH:MM)", value=get_setting(user_id, "reminder_time", "21:30"), key="rem_time")
-            w = st.number_input("허용 오차(분)", min_value=1, max_value=120, value=int(get_setting(user_id, "reminder_window_min", "15")), key="rem_win")
-            if st_autorefresh is not None:
-                ar = st.toggle("자동 갱신(권장)", value=get_setting(user_id, "reminder_autorefresh", "true").lower() == "true", key="rem_ar")
-                sec = st.number_input("갱신 주기(초)", min_value=15, max_value=600, value=int(get_setting(user_id, "reminder_autorefresh_sec", "60")), key="rem_ar_sec")
-            else:
-                ar = None
-                sec = None
-                st.caption("자동 갱신을 쓰려면 streamlit-autorefresh 설치가 필요해요.")
-
+            en_ui = st.toggle("리마인더 켜기", value=en, key="rem_en_ui")
+            t_ui = st.text_input("시간(HH:MM)", value=rt_str, key="rem_t_ui")
+            w_ui = st.number_input("허용 오차(분)", min_value=1, max_value=120, value=win, key="rem_w_ui")
             if st.button("저장", use_container_width=True, key="rem_save"):
-                set_setting(user_id, "reminder_enabled", "true" if en else "false")
-                set_setting(user_id, "reminder_time", (t or "21:30"))
-                set_setting(user_id, "reminder_window_min", str(int(w)))
-                if ar is not None:
-                    set_setting(user_id, "reminder_autorefresh", "true" if ar else "false")
-                    set_setting(user_id, "reminder_autorefresh_sec", str(int(sec)))
+                ls_set("failog_reminder_enabled", "true" if en_ui else "false")
+                ls_set("failog_reminder_time", (t_ui or "21:30"))
+                ls_set("failog_reminder_win", str(int(w_ui)))
                 st.success("저장됐어요.")
 
-    # Right: week + tasks
     with right:
         st.markdown("<div class='card'>", unsafe_allow_html=True)
         st.markdown("### Current Week")
         st.markdown(
             f"<span class='pill pill-strong'>Week</span> "
-            f"<span class='pill pill-muted'>{ws.isoformat()} ~ {(ws+timedelta(days=6)).isoformat()}</span>",
+            f"<span class='pill'>{ws.isoformat()} ~ {(ws+timedelta(days=6)).isoformat()}</span>",
             unsafe_allow_html=True,
         )
         st.write("")
 
-        # week buttons
         wcols = st.columns(7, gap="small")
         days = week_days(ws)
         for i, d in enumerate(days):
@@ -1070,7 +923,6 @@ def screen_planner(user_id: str):
         st.markdown("<hr/>", unsafe_allow_html=True)
         st.markdown(f"#### {selected.isoformat()} ({korean_dow(selected.weekday())})")
 
-        # Add plan (form)
         with st.form("plan_add_form", clear_on_submit=True):
             c1, c2 = st.columns([4, 1])
             with c1:
@@ -1081,7 +933,6 @@ def screen_planner(user_id: str):
                 add_plan_task(user_id, selected, plan_text)
                 st.rerun()
 
-        # Habit manage (min)
         with st.expander("습관(반복) 관리", expanded=False):
             with st.form("habit_add_form", clear_on_submit=True):
                 hc1, hc2 = st.columns([3, 2])
@@ -1128,7 +979,6 @@ def screen_planner(user_id: str):
                             st.success("습관을 삭제했어요.")
                             st.rerun()
 
-        # Tasks list
         df = list_tasks_for_date(user_id, selected)
         if df.empty:
             st.markdown("<div class='small'>아직 항목이 없어요.</div>", unsafe_allow_html=True)
@@ -1147,15 +997,10 @@ def screen_planner(user_id: str):
                 top = st.columns([6, 1.2, 1.2, 1.0], gap="small")
 
                 with top[0]:
-                    st.markdown(
-                        f"**{status_icon} {text}**  "
-                        f"<span class='pill pill-muted'>{badge}</span>",
-                        unsafe_allow_html=True,
-                    )
+                    st.markdown(f"**{status_icon} {text}**  <span class='pill'>{badge}</span>", unsafe_allow_html=True)
                     if status == "fail":
                         st.caption(f"실패 원인: {reason}")
 
-                # Button hierarchy: success primary, others secondary-like
                 with top[1]:
                     if st.button("성공", key=f"s_{tid}", use_container_width=True, type="primary"):
                         update_task_status(user_id, tid, "success")
@@ -1182,14 +1027,11 @@ def screen_planner(user_id: str):
                             st.rerun()
                     with b:
                         st.caption("짧아도 좋아요. ‘무슨 조건 때문에’가 핵심이에요.")
+
                 st.markdown("</div>", unsafe_allow_html=True)
 
         st.markdown("</div>", unsafe_allow_html=True)
 
-
-# =========================
-# Screen: Failure Report
-# =========================
 def screen_failures(user_id: str):
     st.markdown("## Failure Report")
 
@@ -1222,14 +1064,10 @@ def screen_failures(user_id: str):
     df["task_date"] = pd.to_datetime(df["task_date"]).dt.date
     fails = df[df["status"] == "fail"].copy()
 
-    # --- Weekly fail chart (Mon..Sun, small height)
     st.markdown("<div class='card'>", unsafe_allow_html=True)
     st.markdown("### 주간 실패 차트")
-
-    days = week_days(ws)  # Mon..Sun order
-    chart_rows = []
-    for d in days:
-        chart_rows.append({"dow": korean_dow(d.weekday()), "fail_count": int((fails["task_date"] == d).sum())})
+    days = week_days(ws)
+    chart_rows = [{"dow": korean_dow(d.weekday()), "fail_count": int((fails["task_date"] == d).sum())} for d in days]
     chart_df = pd.DataFrame(chart_rows)
 
     chart = (
@@ -1244,13 +1082,11 @@ def screen_failures(user_id: str):
     )
     st.altair_chart(chart, use_container_width=True)
     st.markdown("</div>", unsafe_allow_html=True)
-
     st.write("")
 
-    api_key = effective_openai_key(user_id)
-    model = get_setting(user_id, "openai_model", "gpt-4o-mini")
+    api_key = effective_openai_key()
+    model = effective_openai_model()
 
-    # --- Weekly reason analysis
     st.markdown("<div class='card'>", unsafe_allow_html=True)
     st.markdown("### 원인 주간 분석")
 
@@ -1273,14 +1109,12 @@ def screen_failures(user_id: str):
                 with st.container(border=True):
                     st.markdown(f"**{g.get('cause','원인')}**  ·  ~{g.get('estimated_count',0)}회")
                     st.write(g.get("description", ""))
-                    ex = g.get("examples", []) or []
-                    for s in ex[:3]:
+                    for s in (g.get("examples") or [])[:3]:
                         st.write(f"- {s}")
 
     st.markdown("</div>", unsafe_allow_html=True)
     st.write("")
 
-    # --- Personalized coaching + chat
     st.markdown("<div class='card'>", unsafe_allow_html=True)
     st.markdown("### 맞춤형 AI코칭")
 
@@ -1305,7 +1139,7 @@ def screen_failures(user_id: str):
             {
                 "date": str(r["task_date"]),
                 "task": str(r["text"]),
-                "type": str(r["source"]),  # plan/habit
+                "type": str(r["source"]),
                 "reason": reason,
                 "repeated_2w": bool(flags.get(rnorm, False)),
             }
@@ -1323,28 +1157,24 @@ def screen_failures(user_id: str):
     if coach and isinstance(coach, dict):
         top = coach.get("top_causes", []) or []
         if not top:
-            st.write("코칭 결과가 비어 있어요.")
-        else:
-            for i, c in enumerate(top[:3], start=1):
-                with st.container(border=True):
-                    st.markdown(f"**{i}) {c.get('cause','원인')}**")
-                    st.write(c.get("summary", ""))
-
-                    st.markdown("**실행 조언**")
-                    for tip in (c.get("actionable_advice") or [])[:3]:
+            st.caption("코칭 결과가 비어 있어요. 다시 생성해보세요.")
+        for i, c in enumerate(top[:3], start=1):
+            with st.container(border=True):
+                st.markdown(f"**{i}) {c.get('cause','원인')}**")
+                st.write(c.get("summary", ""))
+                st.markdown("**실행 조언**")
+                for tip in (c.get("actionable_advice") or [])[:3]:
+                    st.write(f"- {tip}")
+                creative = c.get("creative_advice_when_repeated_2w") or []
+                if creative:
+                    st.markdown("**2주+ 반복이면: 창의적 대안**")
+                    for tip in creative[:3]:
                         st.write(f"- {tip}")
-
-                    creative = c.get("creative_advice_when_repeated_2w") or []
-                    if creative:
-                        st.markdown("**2주+ 반복이면: 창의적 대안**")
-                        for tip in creative[:3]:
-                            st.write(f"- {tip}")
     else:
         st.caption("‘코칭 생성/갱신’을 눌러 코칭을 받아보세요.")
 
     st.markdown("<hr/>", unsafe_allow_html=True)
 
-    # Chat (kept at bottom, no extra header box)
     if "chat_messages" not in st.session_state:
         st.session_state["chat_messages"] = []
 
@@ -1358,7 +1188,6 @@ def screen_failures(user_id: str):
         with st.chat_message("user"):
             st.write(user_msg)
 
-        # Personal context: last 14 days reasons + signals + recent fail samples
         end = date.today()
         start = end - timedelta(days=13)
         last14 = get_tasks_range(user_id, start, end)
@@ -1394,46 +1223,88 @@ def screen_failures(user_id: str):
 
     st.markdown("</div>", unsafe_allow_html=True)
 
+# -------------------------
+# Bottom OpenAI panel
+# -------------------------
+def render_openai_bottom_panel():
+    st.markdown("<hr/>", unsafe_allow_html=True)
+    st.markdown("### 🔑 OpenAI 설정")
 
-# =========================
+    default_key = ls_openai_key()
+    default_model = ls_openai_model()
+
+    col1, col2, col3 = st.columns([3.0, 1.6, 1.4])
+    with col1:
+        api_key = st.text_input(
+            "OpenAI API Key",
+            value=st.session_state.get("openai_api_key", "") or default_key,
+            type="password",
+            placeholder="sk-...",
+            key="bottom_openai_key",
+        )
+    with col2:
+        model = st.text_input(
+            "모델",
+            value=st.session_state.get("openai_model", "") or default_model,
+            key="bottom_openai_model",
+        )
+    with col3:
+        save_default = (default_key.strip() != "")
+        save = st.toggle("로컬 저장", value=save_default, help="같은 기기에서만 유지돼요.", key="bottom_openai_save")
+
+    a, b = st.columns([1, 4])
+    with a:
+        if st.button("적용", use_container_width=True, key="bottom_apply", type="primary"):
+            st.session_state["openai_api_key"] = (api_key or "").strip()
+            st.session_state["openai_model"] = (model or "gpt-4o-mini").strip()
+
+            if save:
+                set_ls_openai(api_key or "", model or "gpt-4o-mini")
+            else:
+                # explicitly clear saved key so refresh won't restore it
+                ls_set("failog_openai_key", "")
+                ls_set("failog_openai_model", (model or "gpt-4o-mini").strip())
+
+            st.success("적용됐어요.")
+    with b:
+        st.caption("로컬 저장을 켜면 같은 기기에서는 새로고침/재접속해도 유지돼요.")
+
+# -------------------------
 # Top nav
-# =========================
+# -------------------------
 def top_nav():
     if "screen" not in st.session_state:
         st.session_state["screen"] = "planner"
 
-    c1, c2, _ = st.columns([1.2, 1.5, 6])
+    c1, c2, _ = st.columns([1.2, 1.8, 6])
     with c1:
-        if st.button(" Planner", use_container_width=True, key="nav_plan", type="primary" if st.session_state["screen"]=="planner" else "secondary"):
+        if st.button(" Planner", use_container_width=True, key="nav_plan",
+                     type="primary" if st.session_state["screen"] == "planner" else "secondary"):
             st.session_state["screen"] = "planner"
             st.rerun()
     with c2:
-        if st.button("Failure Report", use_container_width=True, key="nav_fail", type="primary" if st.session_state["screen"]=="fail" else "secondary"):
+        if st.button("Failure Report", use_container_width=True, key="nav_fail",
+                     type="primary" if st.session_state["screen"] == "fail" else "secondary"):
             st.session_state["screen"] = "fail"
             st.rerun()
 
     st.write("")
     return st.session_state["screen"]
 
-
-# =========================
+# -------------------------
 # Main
-# =========================
+# -------------------------
 def main():
     st.set_page_config(page_title="FAILOG", page_icon="🧊", layout="wide")
     inject_css()
+    init_db()
 
-    # init / migrate schema once
-    init_db_and_migrate_if_needed()
-
-    # user id
+    # IMPORTANT: device user_id from localStorage (stable)
     user_id = get_or_create_user_id()
-    st.session_state["user_id"] = user_id
 
-    # per-user default settings
-    ensure_user_settings(user_id)
+    # Restore from localStorage snapshot if DB for this user is empty
+    restore_from_snapshot_if_needed(user_id)
 
-    # header
     st.markdown("# FAILOG")
     st.markdown(
         "<div class='small'>실패를 성공으로! 계획과 습관의 실패를 기록하고 맞춤형 코칭을 받아보자</div>",
@@ -1441,18 +1312,13 @@ def main():
     )
     st.write("")
 
-    # nav
     screen = top_nav()
-
     if screen == "planner":
         screen_planner(user_id)
     else:
         screen_failures(user_id)
 
-    render_openai_bottom_panel(user_id)
-
+    render_openai_bottom_panel()
 
 if __name__ == "__main__":
     main()
-
-
