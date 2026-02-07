@@ -1,47 +1,41 @@
 # app.py
 # ------------------------------------------------------------
-# FAILOG (Device-separated, no-login) - COOKIE VERSION (READY-SAFE)
-# ✅ Same browser/device: refresh/reopen keeps everything (user_id + settings)
-# ✅ Different browser/device: completely different app instance (different user_id)
+# FAILOG (Device-separated, no-login) - STABLE COOKIE VERSION
+# 목표:
+# ✅ 새로고침/재접속해도 user_id가 절대 안 바뀜 (같은 브라우저/기기 기준)
+# ✅ 쿠키 ready() 같은 불안정 로직 제거 (extra-streamlit-components 사용)
+# ✅ PDF 리포트 한글 깨짐(검은 박스) 해결: 폰트 자동 다운로드 + 임베드
 #
-# Key fix:
-# - localStorage 완전 제거
-# - streamlit-cookies-manager의 CookiesNotReady 루프 방지:
-#   - ready() 되기 전에는 쿠키 get/set/del 절대 호출하지 않음
-#   - ready 전에는 임시 session uid로 UI를 "끝까지" 렌더해 ready가 뜨게 함
-#   - ready 되는 순간 cookie uid를 고정 저장하고 rerun
-#
-# Features added (per your request):
-# A) Open-Meteo 날씨 연동 (키 필요 없음)
-# B) 주간 PDF 리포트 내보내기 + 대시보드(요일/원인 트렌드)
+# Features:
+# A) Open-Meteo 날씨 연동(키 필요 없음)
+# B) 대시보드(주별 원인 트렌드) + 주간 PDF 리포트 내보내기
 #
 # Install:
-#   pip install streamlit pandas altair openai requests reportlab matplotlib streamlit-cookies-manager
+#   pip install streamlit pandas altair requests reportlab matplotlib openai extra-streamlit-components
 #   (optional) pip install streamlit-autorefresh
 #
 # Run:
 #   streamlit run app.py
 # ------------------------------------------------------------
 
+import io
 import json
+import os
 import re
 import sqlite3
 import uuid
-import io
-import os
-import glob
 from datetime import date, datetime, timedelta, time
-from typing import Optional, List, Dict, Any
+from typing import Any, Dict, List, Optional
 
-import pandas as pd
-import streamlit as st
 import altair as alt
-from zoneinfo import ZoneInfo
+import matplotlib.pyplot as plt
+import pandas as pd
 import requests
+import streamlit as st
+from zoneinfo import ZoneInfo
 
-# Cookies
-from streamlit_cookies_manager import EncryptedCookieManager
-from streamlit_cookies_manager.cookie_manager import CookiesNotReady
+# Cookie manager (stable)
+import extra_streamlit_components as stx
 
 # Optional autorefresh
 try:
@@ -56,88 +50,31 @@ except Exception:
     OpenAI = None
 
 # PDF
+from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import mm
-from reportlab.lib import colors
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image as RLImage
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
-
-# charts for PDF images
-import matplotlib.pyplot as plt
+from reportlab.platypus import Image as RLImage
+from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 
 
 KST = ZoneInfo("Asia/Seoul")
 DB_PATH = "planner.db"
 ACCENT = "#A0C4F2"
 
+FONTS_DIR = "fonts"
+KOREAN_FONT_PATH = os.path.join(FONTS_DIR, "NanumGothic-Regular.ttf")
+KOREAN_FONT_NAME = "NanumGothicRegular"
+
+# A known-good TTF file (small enough, permissive license) hosted by Google Fonts
+NANUM_TTF_URL = "https://github.com/google/fonts/raw/main/ofl/nanumgothic/NanumGothic-Regular.ttf"
+
+
 # ============================================================
-# ✅ COOKIES (READY-SAFE)
-# ============================================================
-# IMPORTANT:
-# - 아래 password는 반드시 프로젝트에서 "충분히 긴 랜덤 문자열"로 바꾸세요.
-# - OpenAI 키를 쿠키에 저장하는 것은 보안상 민감합니다. "쿠키 저장"을 켠 경우에만 저장됩니다.
-COOKIE_PASSWORD = "CHANGE_THIS_TO_A_RANDOM_LONG_SECRET_32CHARS_PLUS"
-
-def cookies() -> EncryptedCookieManager:
-    if "cookie_mgr" not in st.session_state:
-        st.session_state["cookie_mgr"] = EncryptedCookieManager(
-            prefix="failog_",
-            password=COOKIE_PASSWORD,
-        )
-    return st.session_state["cookie_mgr"]
-
-def cookie_ready() -> bool:
-    try:
-        return cookies().ready()
-    except Exception:
-        return False
-
-def ck_get(key: str, default: str = "") -> str:
-    # ready 전에는 절대 mgr.get 호출 금지
-    if not cookie_ready():
-        return default
-    mgr = cookies()
-    try:
-        v = mgr.get(key)
-        return default if v is None else str(v)
-    except CookiesNotReady:
-        return default
-    except Exception:
-        return default
-
-def ck_set(key: str, value: str):
-    # ready 전에는 절대 mgr[...] / save 호출 금지
-    if not cookie_ready():
-        return
-    mgr = cookies()
-    try:
-        mgr[key] = str(value if value is not None else "")
-        mgr.save()
-    except CookiesNotReady:
-        return
-    except Exception:
-        return
-
-def ck_del(key: str):
-    if not cookie_ready():
-        return
-    mgr = cookies()
-    try:
-        # __contains__도 내부적으로 cookies를 읽을 수 있어 안전하게 try 안에서 처리
-        if key in mgr:
-            del mgr[key]
-            mgr.save()
-    except CookiesNotReady:
-        return
-    except Exception:
-        return
-
-
-# -------------------------
 # UI / CSS
-# -------------------------
+# ============================================================
 def inject_css():
     st.markdown(
         f"""
@@ -206,42 +143,87 @@ hr {{
     )
 
 
-# -------------------------
-# Stable device user_id (COOKIE, READY-SAFE)
-# -------------------------
+# ============================================================
+# Cookies (stable)
+# ============================================================
+def cookie_mgr() -> stx.CookieManager:
+    if "x_cookie_mgr" not in st.session_state:
+        st.session_state["x_cookie_mgr"] = stx.CookieManager()
+    return st.session_state["x_cookie_mgr"]
+
+
+def ck_get(key: str, default: str = "") -> str:
+    try:
+        v = cookie_mgr().get(key)
+        return default if v is None else str(v)
+    except Exception:
+        return default
+
+
+def ck_set(key: str, value: str, expires_days: int = 3650):
+    """
+    extra-streamlit-components CookieManager는 버전별로 set() 시그니처가 조금 다를 수 있어
+    안전하게 여러 형태로 시도한다.
+    """
+    cm = cookie_mgr()
+    v = "" if value is None else str(value)
+    try:
+        # Some versions support expires_at_days
+        if "expires_at_days" in cm.set.__code__.co_varnames:
+            cm.set(key, v, expires_at_days=int(expires_days))
+        else:
+            cm.set(key, v)
+    except Exception:
+        try:
+            cm.set(key, v)
+        except Exception:
+            pass
+
+
+def ck_del(key: str):
+    cm = cookie_mgr()
+    for fn in ("delete", "remove", "delete_cookie"):
+        if hasattr(cm, fn):
+            try:
+                getattr(cm, fn)(key)
+                return
+            except Exception:
+                pass
+    # fallback: set empty
+    try:
+        cm.set(key, "")
+    except Exception:
+        pass
+
+
+# ============================================================
+# Stable device user_id (cookie, no rerun needed)
+# ============================================================
 def get_or_create_user_id() -> str:
-    # 1) 쿠키가 ready이면: cookie uid를 source of truth로 고정
-    if cookie_ready():
-        uid = ck_get("uid", "").strip()
-        if uid:
-            st.session_state["user_id"] = uid
-            return uid
+    uid = ck_get("failog_uid", "").strip()
+    if uid:
+        st.session_state["user_id"] = uid
+        return uid
 
-        # 쿠키 ready인데 uid가 없으면 생성 후 저장
-        new_uid = str(uuid.uuid4())
-        st.session_state["user_id"] = new_uid
-        ck_set("uid", new_uid)
-        st.rerun()
-
-    # 2) 쿠키 not-ready이면: 임시 session uid로 앱을 끝까지 렌더 (ready 뜰 기회를 줌)
-    if not st.session_state.get("user_id"):
-        st.session_state["user_id"] = str(uuid.uuid4())
-
-    # 안내만(중단 금지)
-    st.info("쿠키 초기화 중… 잠시 후 자동으로 고정 user_id로 전환돼요.")
-    return st.session_state["user_id"]
+    # create once and persist
+    new_uid = str(uuid.uuid4())
+    ck_set("failog_uid", new_uid)
+    st.session_state["user_id"] = new_uid
+    return new_uid
 
 
-# -------------------------
+# ============================================================
 # DB
-# -------------------------
+# ============================================================
 def conn():
     c = sqlite3.connect(DB_PATH, check_same_thread=False)
     c.execute("PRAGMA foreign_keys = ON;")
     return c
 
+
 def now_iso() -> str:
     return datetime.now(KST).isoformat(timespec="seconds")
+
 
 def init_db():
     c = conn()
@@ -280,17 +262,20 @@ def init_db():
     c.close()
 
 
-# -------------------------
+# ============================================================
 # Date helpers (Mon-Sun)
-# -------------------------
+# ============================================================
 def week_start(d: date) -> date:
     return d - timedelta(days=d.weekday())
+
 
 def week_days(ws: date) -> List[date]:
     return [ws + timedelta(days=i) for i in range(7)]
 
+
 def korean_dow(i: int) -> str:
     return ["월", "화", "수", "목", "금", "토", "일"][i]
+
 
 def month_grid(year: int, month: int) -> List[List[Optional[date]]]:
     first = date(year, month, 1)
@@ -317,9 +302,9 @@ def month_grid(year: int, month: int) -> List[List[Optional[date]]]:
     return grid
 
 
-# -------------------------
+# ============================================================
 # Habits / Tasks
-# -------------------------
+# ============================================================
 def list_habits(user_id: str, active_only: bool = True) -> pd.DataFrame:
     c = conn()
     q = "SELECT id, title, dow_mask, active FROM habits WHERE user_id=?"
@@ -330,6 +315,7 @@ def list_habits(user_id: str, active_only: bool = True) -> pd.DataFrame:
     df = pd.read_sql_query(q, c, params=params)
     c.close()
     return df
+
 
 def add_habit(user_id: str, title: str, dows: List[int]):
     title = (title or "").strip()
@@ -352,6 +338,7 @@ def add_habit(user_id: str, title: str, dows: List[int]):
     c.commit()
     c.close()
 
+
 def set_habit_active(user_id: str, habit_id: int, active: bool):
     c = conn()
     c.execute(
@@ -360,6 +347,7 @@ def set_habit_active(user_id: str, habit_id: int, active: bool):
     )
     c.commit()
     c.close()
+
 
 def delete_habit(user_id: str, habit_id: int):
     today = date.today().isoformat()
@@ -375,6 +363,7 @@ def delete_habit(user_id: str, habit_id: int):
     cur.execute("DELETE FROM habits WHERE user_id=? AND id=?", (user_id, habit_id))
     c.commit()
     c.close()
+
 
 def ensure_week_habit_tasks(user_id: str, ws: date):
     habits = list_habits(user_id, active_only=True)
@@ -401,6 +390,7 @@ def ensure_week_habit_tasks(user_id: str, ws: date):
     c.commit()
     c.close()
 
+
 def add_plan_task(user_id: str, d: date, text: str):
     text = (text or "").strip()
     if not text:
@@ -417,11 +407,13 @@ def add_plan_task(user_id: str, d: date, text: str):
     c.commit()
     c.close()
 
+
 def delete_task(user_id: str, task_id: int):
     c = conn()
     c.execute("DELETE FROM tasks WHERE user_id=? AND id=?", (user_id, task_id))
     c.commit()
     c.close()
+
 
 def list_tasks_for_date(user_id: str, d: date) -> pd.DataFrame:
     c = conn()
@@ -438,6 +430,7 @@ def list_tasks_for_date(user_id: str, d: date) -> pd.DataFrame:
     c.close()
     return df
 
+
 def update_task_status(user_id: str, task_id: int, status: str):
     c = conn()
     c.execute(
@@ -452,6 +445,7 @@ def update_task_status(user_id: str, task_id: int, status: str):
     c.commit()
     c.close()
 
+
 def update_task_fail(user_id: str, task_id: int, reason: str):
     reason = (reason or "").strip() or "이유 미기록"
     c = conn()
@@ -461,6 +455,7 @@ def update_task_fail(user_id: str, task_id: int, reason: str):
     )
     c.commit()
     c.close()
+
 
 def get_tasks_range(user_id: str, start_d: date, end_d: date) -> pd.DataFrame:
     c = conn()
@@ -476,6 +471,7 @@ def get_tasks_range(user_id: str, start_d: date, end_d: date) -> pd.DataFrame:
     )
     c.close()
     return df
+
 
 def get_all_failures(user_id: str, limit: int = 350) -> pd.DataFrame:
     c = conn()
@@ -493,6 +489,7 @@ def get_all_failures(user_id: str, limit: int = 350) -> pd.DataFrame:
     c.close()
     return df
 
+
 def count_today_todos(user_id: str) -> int:
     today = date.today().isoformat()
     c = conn()
@@ -504,9 +501,9 @@ def count_today_todos(user_id: str) -> int:
     return int(row[0] if row else 0)
 
 
-# -------------------------
-# Reminder (COOKIE)
-# -------------------------
+# ============================================================
+# Reminder (cookie)
+# ============================================================
 def parse_hhmm(s: str) -> time:
     s = (s or "").strip()
     m = re.match(r"^(\d{1,2}):(\d{2})$", s)
@@ -517,15 +514,16 @@ def parse_hhmm(s: str) -> time:
     mm = max(0, min(59, mm))
     return time(hh, mm)
 
+
 def should_remind(now_dt: datetime, remind_t: time, window_min: int) -> bool:
     target = datetime.combine(now_dt.date(), remind_t, tzinfo=KST)
     delta_min = abs((now_dt - target).total_seconds()) / 60.0
     return delta_min <= float(window_min)
 
 
-# -------------------------
-# OpenAI (COOKIE, READY-SAFE)
-# -------------------------
+# ============================================================
+# OpenAI (cookie)
+# ============================================================
 def openai_client(api_key: str):
     if OpenAI is None:
         raise RuntimeError("openai 패키지가 설치되지 않았어요. pip install openai")
@@ -533,29 +531,34 @@ def openai_client(api_key: str):
         raise RuntimeError("OpenAI API Key가 비어 있어요.")
     return OpenAI(api_key=api_key.strip())
 
+
 def ck_openai_key() -> str:
-    return ck_get("openai_key", "").strip()
+    return ck_get("failog_openai_key", "").strip()
+
 
 def ck_openai_model() -> str:
-    m = ck_get("openai_model", "gpt-4o-mini").strip()
+    m = ck_get("failog_openai_model", "gpt-4o-mini").strip()
     return m if m else "gpt-4o-mini"
+
 
 def effective_openai_key() -> str:
     sk = st.session_state.get("openai_api_key", "")
     return sk.strip() if sk and sk.strip() else ck_openai_key()
 
+
 def effective_openai_model() -> str:
     sm = st.session_state.get("openai_model", "")
     return sm.strip() if sm and sm.strip() else ck_openai_model()
 
+
 def set_ck_openai(api_key: str, model: str):
-    ck_set("openai_key", (api_key or "").strip())
-    ck_set("openai_model", (model or "gpt-4o-mini").strip())
+    ck_set("failog_openai_key", (api_key or "").strip())
+    ck_set("failog_openai_model", (model or "gpt-4o-mini").strip())
 
 
-# -------------------------
+# ============================================================
 # Coaching prompt
-# -------------------------
+# ============================================================
 BASE_COACH_PROMPT = (
     "사용자의 계획 실패 이유 목록을 분석해 공통 원인을 3가지 이내로 분류하고, "
     "각 원인에 대해 실행 가능하고 현실적인 개선 조언을 제시해줘. "
@@ -591,11 +594,13 @@ COACH_SCHEMA = """
 - repeated_2w=true 항목이 하나라도 있으면 해당 원인에는 creative_advice_when_repeated_2w를 반드시 채워라
 """
 
+
 def normalize_reason(text: str) -> str:
     t = (text or "").strip().lower()
     t = re.sub(r"\s+", " ", t)
     t = re.sub(r"[^\w\s가-힣]", "", t)
     return t
+
 
 def repeated_reason_flags(df_fail: pd.DataFrame) -> Dict[str, bool]:
     if df_fail.empty:
@@ -611,6 +616,7 @@ def repeated_reason_flags(df_fail: pd.DataFrame) -> Dict[str, bool]:
         if len(dates) >= 2 and (dates[-1] - dates[0]).days >= 14:
             flags[rnorm] = True
     return flags
+
 
 def compute_user_signals(user_id: str, days: int = 28) -> Dict[str, Any]:
     end = date.today()
@@ -666,6 +672,7 @@ def compute_user_signals(user_id: str, days: int = 28) -> Dict[str, Any]:
         "top_reasons": top_reasons,
     }
 
+
 def llm_weekly_reason_analysis(api_key: str, model: str, reasons: List[str]) -> Dict[str, Any]:
     client = openai_client(api_key)
     prompt = f"""
@@ -697,6 +704,7 @@ def llm_weekly_reason_analysis(api_key: str, model: str, reasons: List[str]) -> 
         m = re.search(r"\{.*\}", text, flags=re.DOTALL)
         return json.loads(m.group(0)) if m else {"groups": []}
 
+
 def llm_overall_coaching(api_key: str, model: str, fail_items: List[Dict[str, Any]], signals: Dict[str, Any]) -> Dict[str, Any]:
     client = openai_client(api_key)
     prompt = f"""
@@ -726,6 +734,7 @@ def llm_overall_coaching(api_key: str, model: str, fail_items: List[Dict[str, An
         m = re.search(r"\{.*\}", text, flags=re.DOTALL)
         return json.loads(m.group(0)) if m else {"top_causes": []}
 
+
 def llm_chat(api_key: str, model: str, system_context: str, msgs: List[Dict[str, str]]) -> str:
     client = openai_client(api_key)
     resp = client.chat.completions.create(
@@ -749,25 +758,16 @@ WEATHER_CODE_KO = {
     51: "이슬비(약)",
     53: "이슬비(중)",
     55: "이슬비(강)",
-    56: "어는 이슬비(약)",
-    57: "어는 이슬비(강)",
     61: "비(약)",
     63: "비(중)",
     65: "비(강)",
-    66: "어는 비(약)",
-    67: "어는 비(강)",
     71: "눈(약)",
     73: "눈(중)",
     75: "눈(강)",
-    77: "싸라기눈",
     80: "소나기(약)",
     81: "소나기(중)",
     82: "소나기(강)",
-    85: "눈 소나기(약)",
-    86: "눈 소나기(강)",
     95: "뇌우",
-    96: "뇌우(우박 약)",
-    99: "뇌우(우박 강)",
 }
 
 @st.cache_data(ttl=60 * 60, show_spinner=False)
@@ -785,11 +785,7 @@ def geocode_city(city_name: str) -> Optional[Dict[str, Any]]:
 
 @st.cache_data(ttl=60 * 30, show_spinner=False)
 def fetch_daily_weather(lat: float, lon: float, d: date, tz: str = "Asia/Seoul") -> Optional[Dict[str, Any]]:
-    if d <= date.today():
-        base = "https://archive-api.open-meteo.com/v1/archive"
-    else:
-        base = "https://api.open-meteo.com/v1/forecast"
-
+    base = "https://archive-api.open-meteo.com/v1/archive" if d <= date.today() else "https://api.open-meteo.com/v1/forecast"
     params = {
         "latitude": float(lat),
         "longitude": float(lon),
@@ -801,7 +797,6 @@ def fetch_daily_weather(lat: float, lon: float, d: date, tz: str = "Asia/Seoul")
     r = requests.get(base, params=params, timeout=10)
     r.raise_for_status()
     js = r.json()
-
     daily = js.get("daily") or {}
     times = daily.get("time") or []
     if not times:
@@ -828,20 +823,20 @@ def weather_card(selected: date):
     st.markdown("<div class='card'>", unsafe_allow_html=True)
     st.markdown("### 🌤️ Weather (Open-Meteo)")
 
-    default_city = ck_get("city", "Seoul")
+    default_city = ck_get("failog_city", "Seoul")
     city = st.text_input("도시/지역", value=default_city, key="weather_city_input", help="예: Seoul, Busan, Tokyo")
 
     colA, colB = st.columns([1, 1])
     with colA:
         if st.button("도시 저장", use_container_width=True, key="weather_save_city"):
-            ck_set("city", (city or "Seoul").strip())
+            ck_set("failog_city", (city or "Seoul").strip())
             st.success("저장됐어요.")
             st.rerun()
     with colB:
-        show = st.toggle("표시", value=(ck_get("weather_show", "true") == "true"), key="weather_show_toggle")
-        ck_set("weather_show", "true" if show else "false")
+        show = st.toggle("표시", value=(ck_get("failog_weather_show", "true") == "true"), key="weather_show_toggle")
+        ck_set("failog_weather_show", "true" if show else "false")
 
-    if (ck_get("weather_show", "true") != "true"):
+    if ck_get("failog_weather_show", "true") != "true":
         st.markdown("<div class='small'>날씨 표시가 꺼져 있어요.</div>", unsafe_allow_html=True)
         st.markdown("</div>", unsafe_allow_html=True)
         return
@@ -875,8 +870,7 @@ def weather_card(selected: date):
         pp = w.get("precip_prob")
         ps = w.get("precip_sum")
         c3.metric("강수", f"{pp}% / {ps}mm" if pp is not None and ps is not None else "—")
-
-        st.caption("데이터 출처: Open-Meteo (Forecast/Archive)")
+        st.caption("데이터 출처: Open-Meteo")
     except Exception as e:
         st.error(f"날씨 로딩 실패: {type(e).__name__}")
     finally:
@@ -884,28 +878,49 @@ def weather_card(selected: date):
 
 
 # ============================================================
-# B) Weekly PDF report + Dashboard
+# B) Weekly PDF report + Dashboard (Korean font fixed)
 # ============================================================
-def try_register_korean_font() -> str:
-    if st.session_state.get("__pdf_font_name"):
-        return st.session_state["__pdf_font_name"]
+def ensure_korean_font_downloaded() -> bool:
+    """
+    한글 깨짐(검은 박스) 방지를 위해 TTF를 프로젝트 로컬에 확보.
+    - 로컬에 없으면 GitHub(google/fonts)에서 다운로드 시도
+    """
+    try:
+        os.makedirs(FONTS_DIR, exist_ok=True)
+        if os.path.exists(KOREAN_FONT_PATH) and os.path.getsize(KOREAN_FONT_PATH) > 50_000:
+            return True
 
-    candidates = []
-    candidates += glob.glob("/usr/share/fonts/**/NotoSansCJK*.ttc", recursive=True)
-    candidates += glob.glob("/usr/share/fonts/**/NotoSansKR*.ttf", recursive=True)
-    candidates += glob.glob("/usr/share/fonts/**/NanumGothic*.ttf", recursive=True)
+        r = requests.get(NANUM_TTF_URL, timeout=20)
+        r.raise_for_status()
+        with open(KOREAN_FONT_PATH, "wb") as f:
+            f.write(r.content)
+        return os.path.exists(KOREAN_FONT_PATH) and os.path.getsize(KOREAN_FONT_PATH) > 50_000
+    except Exception:
+        return False
 
-    for path in candidates:
+
+def register_korean_font() -> str:
+    """
+    ReportLab에 폰트를 등록해서 PDF에 임베드(=한글 깨짐 방지).
+    """
+    if st.session_state.get("__pdf_font_registered__", False):
+        return st.session_state.get("__pdf_font_name__", "Helvetica")
+
+    ok = ensure_korean_font_downloaded()
+    if ok:
         try:
-            font_name = os.path.splitext(os.path.basename(path))[0]
-            pdfmetrics.registerFont(TTFont(font_name, path))
-            st.session_state["__pdf_font_name"] = font_name
-            return font_name
+            pdfmetrics.registerFont(TTFont(KOREAN_FONT_NAME, KOREAN_FONT_PATH))
+            st.session_state["__pdf_font_registered__"] = True
+            st.session_state["__pdf_font_name__"] = KOREAN_FONT_NAME
+            return KOREAN_FONT_NAME
         except Exception:
-            continue
+            pass
 
-    st.session_state["__pdf_font_name"] = "Helvetica"
+    # fallback (한글 깨질 수 있으니 경고는 UI에서 별도로)
+    st.session_state["__pdf_font_registered__"] = True
+    st.session_state["__pdf_font_name__"] = "Helvetica"
     return "Helvetica"
+
 
 def failures_by_dow(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
@@ -919,6 +934,7 @@ def failures_by_dow(df: pd.DataFrame) -> pd.DataFrame:
         rows.append({"dow": dname, "fail_count": int((x["task_date"].map(lambda d: d.weekday()) == i).sum())})
     return pd.DataFrame(rows)
 
+
 def top_reasons(df: pd.DataFrame, topk: int = 8) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame(columns=["reason", "count"])
@@ -927,6 +943,7 @@ def top_reasons(df: pd.DataFrame, topk: int = 8) -> pd.DataFrame:
     s = s[s != ""]
     vc = s.value_counts().head(topk)
     return pd.DataFrame({"reason": vc.index.tolist(), "count": vc.values.tolist()})
+
 
 def weekly_reason_trend(user_id: str, weeks: int = 12, topk: int = 6) -> pd.DataFrame:
     end = date.today()
@@ -947,17 +964,15 @@ def weekly_reason_trend(user_id: str, weeks: int = 12, topk: int = 6) -> pd.Data
     df = df[df["reason"].isin(top)].copy()
 
     df["week"] = df["task_date"].map(lambda d: week_start(d).isoformat())
-    out = (
-        df.groupby(["week", "reason"]).size().reset_index(name="count")
-        .sort_values(["week", "count"], ascending=[True, False])
-    )
+    out = df.groupby(["week", "reason"]).size().reset_index(name="count").sort_values(["week", "count"], ascending=[True, False])
     return out
+
 
 def make_matplotlib_bar_png(data: pd.DataFrame, xcol: str, ycol: str, title: str) -> bytes:
     fig = plt.figure(figsize=(6.2, 2.4), dpi=160)
     ax = fig.add_subplot(111)
     ax.bar(data[xcol].tolist(), data[ycol].tolist())
-    ax.set_title(title)
+    ax.set_title(title)  # 영어로 유지(폰트 이슈 회피)
     ax.set_xlabel("")
     ax.set_ylabel("")
     fig.tight_layout()
@@ -967,6 +982,7 @@ def make_matplotlib_bar_png(data: pd.DataFrame, xcol: str, ycol: str, title: str
     plt.close(fig)
     buf.seek(0)
     return buf.read()
+
 
 def build_weekly_pdf_bytes(user_id: str, ws: date, city_label: str = "") -> bytes:
     we = ws + timedelta(days=6)
@@ -979,7 +995,7 @@ def build_weekly_pdf_bytes(user_id: str, ws: date, city_label: str = "") -> byte
         "todo": int((df["status"] == "todo").sum()) if not df.empty else 0,
     }
 
-    font_name = try_register_korean_font()
+    font_name = register_korean_font()
     styles = getSampleStyleSheet()
     base = ParagraphStyle(name="Base", parent=styles["Normal"], fontName=font_name, fontSize=10.5, leading=14)
     h1 = ParagraphStyle(name="H1", parent=styles["Heading1"], fontName=font_name, fontSize=16, leading=20, spaceAfter=8)
@@ -1081,9 +1097,9 @@ def build_weekly_pdf_bytes(user_id: str, ws: date, city_label: str = "") -> byte
     return buf.read()
 
 
-# -------------------------
+# ============================================================
 # Screens
-# -------------------------
+# ============================================================
 def screen_planner(user_id: str):
     st.markdown("## Planner")
 
@@ -1097,10 +1113,10 @@ def screen_planner(user_id: str):
     ws = week_start(selected)
     ensure_week_habit_tasks(user_id, ws)
 
-    # Reminder settings in COOKIE (ready-safe via ck_get)
-    en = (ck_get("rem_enabled", "true").lower() == "true")
-    rt_str = ck_get("rem_time", "21:30")
-    win_str = ck_get("rem_win", "15")
+    # Reminder settings in cookie
+    en = (ck_get("failog_rem_enabled", "true").lower() == "true")
+    rt_str = ck_get("failog_rem_time", "21:30")
+    win_str = ck_get("failog_rem_win", "15")
     remind_t = parse_hhmm(rt_str)
     try:
         win = int(win_str)
@@ -1173,9 +1189,9 @@ def screen_planner(user_id: str):
             t_ui = st.text_input("시간(HH:MM)", value=rt_str, key="rem_t_ui")
             w_ui = st.number_input("허용 오차(분)", min_value=1, max_value=120, value=win, key="rem_w_ui")
             if st.button("저장", use_container_width=True, key="rem_save"):
-                ck_set("rem_enabled", "true" if en_ui else "false")
-                ck_set("rem_time", (t_ui or "21:30"))
-                ck_set("rem_win", str(int(w_ui)))
+                ck_set("failog_rem_enabled", "true" if en_ui else "false")
+                ck_set("failog_rem_time", (t_ui or "21:30"))
+                ck_set("failog_rem_win", str(int(w_ui)))
                 st.success("저장됐어요.")
 
         weather_card(selected)
@@ -1349,7 +1365,7 @@ def screen_failures(user_id: str):
 
     with tab1:
         st.markdown("<div class='card'>", unsafe_allow_html=True)
-        st.markdown("### 📊 Dashboard (최근 트렌드)")
+        st.markdown("### 📊 Dashboard (주별 원인 트렌드)")
 
         colA, colB = st.columns([1.2, 1.0])
         with colA:
@@ -1550,10 +1566,10 @@ def screen_failures(user_id: str):
 
     with tab3:
         st.markdown("<div class='card'>", unsafe_allow_html=True)
-        st.markdown("### 🧾 Weekly PDF 리포트")
-        st.caption("이 탭은 OpenAI 없이도 동작해요.")
+        st.markdown("### 🧾 Weekly PDF 리포트 (한글 폰트 자동 포함)")
+        st.caption("PDF에서 한글이 네모로 나오면: 폰트 다운로드가 막힌 환경일 수 있어요(네트워크 제한 등).")
 
-        city = ck_get("city", "").strip()
+        city = ck_get("failog_city", "").strip()
         city_label = ""
         try:
             if city:
@@ -1562,6 +1578,13 @@ def screen_failures(user_id: str):
                     city_label = f"{g.get('name','')} · {g.get('country','')}"
         except Exception:
             city_label = city
+
+        # 미리 폰트 준비 시도 + 상태 표시
+        font_ready = ensure_korean_font_downloaded()
+        if not font_ready:
+            st.warning("한글 폰트 다운로드에 실패했어요. 네트워크 제한이 있으면 리포트 한글이 깨질 수 있어요.")
+        else:
+            st.success("PDF 한글 폰트 준비 완료")
 
         c1, c2, c3 = st.columns([1.1, 1.1, 2.2])
         with c1:
@@ -1590,9 +1613,9 @@ def screen_failures(user_id: str):
         st.markdown("</div>", unsafe_allow_html=True)
 
 
-# -------------------------
-# Bottom OpenAI panel (COOKIE, READY-SAFE)
-# -------------------------
+# ============================================================
+# Bottom OpenAI panel (cookie)
+# ============================================================
 def render_openai_bottom_panel():
     st.markdown("<hr/>", unsafe_allow_html=True)
     st.markdown("### 🔑 OpenAI 설정 (쿠키 저장 옵션)")
@@ -1628,36 +1651,44 @@ def render_openai_bottom_panel():
             if save:
                 set_ck_openai(api_key or "", model or "gpt-4o-mini")
             else:
-                ck_del("openai_key")
-                ck_set("openai_model", (model or "gpt-4o-mini").strip())
+                ck_del("failog_openai_key")
+                ck_set("failog_openai_model", (model or "gpt-4o-mini").strip())
 
             st.success("적용됐어요.")
     with b:
         if st.button("저장값 삭제", use_container_width=True, key="bottom_clear"):
-            ck_del("openai_key")
-            ck_del("openai_model")
+            ck_del("failog_openai_key")
+            ck_del("failog_openai_model")
             st.success("쿠키 저장값을 삭제했어요.")
             st.rerun()
     with c:
-        st.caption("쿠키 저장을 켜면 같은 브라우저에서는 새로고침/재접속해도 유지돼요. (공유 PC에서는 끄세요)")
+        st.caption("쿠키 저장을 켜면 새로고침/재접속해도 유지돼요. (공유 PC에서는 끄세요)")
 
 
-# -------------------------
+# ============================================================
 # Top nav
-# -------------------------
+# ============================================================
 def top_nav():
     if "screen" not in st.session_state:
         st.session_state["screen"] = "planner"
 
     c1, c2, _ = st.columns([1.2, 1.8, 6])
     with c1:
-        if st.button(" Planner", use_container_width=True, key="nav_plan",
-                     type="primary" if st.session_state["screen"] == "planner" else "secondary"):
+        if st.button(
+            " Planner",
+            use_container_width=True,
+            key="nav_plan",
+            type="primary" if st.session_state["screen"] == "planner" else "secondary",
+        ):
             st.session_state["screen"] = "planner"
             st.rerun()
     with c2:
-        if st.button("Failure Report", use_container_width=True, key="nav_fail",
-                     type="primary" if st.session_state["screen"] == "fail" else "secondary"):
+        if st.button(
+            "Failure Report",
+            use_container_width=True,
+            key="nav_fail",
+            type="primary" if st.session_state["screen"] == "fail" else "secondary",
+        ):
             st.session_state["screen"] = "fail"
             st.rerun()
 
@@ -1665,16 +1696,18 @@ def top_nav():
     return st.session_state["screen"]
 
 
-# -------------------------
+# ============================================================
 # Main
-# -------------------------
+# ============================================================
 def main():
     st.set_page_config(page_title="FAILOG", page_icon="🧊", layout="wide")
     inject_css()
     init_db()
 
-    # ❌ cookies()를 여기서 강제 호출하지 않음 (not-ready 문제를 앞당길 수 있음)
+    # IMPORTANT: cookie manager MUST be instantiated (component render)
+    _ = cookie_mgr()
 
+    # Stable user_id (same browser/device => never changes)
     user_id = get_or_create_user_id()
 
     st.markdown("# FAILOG")
@@ -1683,6 +1716,9 @@ def main():
         unsafe_allow_html=True,
     )
     st.write("")
+
+    # Debug (optional): show short uid to confirm stability
+    st.caption(f"device id: {user_id[:8]}… (same browser stays same)")
 
     screen = top_nav()
     if screen == "planner":
