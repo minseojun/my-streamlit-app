@@ -875,7 +875,7 @@ CATEGORY_SCHEMA = """
   }
 }
 규칙:
-- categories 최대 {max_categories}개
+- categories 최대 __MAX_CATEGORIES__개
 - mapping의 키는 반드시 입력 원문 목록에 존재하는 문자열 그대로
 - mapping 값은 categories[].name 중 하나
 - 애매하면 '기타' 카테고리를 하나 포함해도 됨 (그 경우 name='기타')
@@ -918,8 +918,9 @@ def llm_build_category_map(api_key: str, model: str, reasons: List[str], max_cat
 실패 원인 원문 목록:
 {json.dumps(reasons_limited, ensure_ascii=False, indent=2)}
 
-{CATEGORY_SCHEMA.format(max_categories=max_categories)}
-""".strip()
+schema = CATEGORY_SCHEMA.replace("__MAX_CATEGORIES__", str(max_categories))
+...
+{schema}""".strip()
 
     resp = client.chat.completions.create(
         model=model,
@@ -2059,4 +2060,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
