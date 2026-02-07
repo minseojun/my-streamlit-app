@@ -200,16 +200,19 @@ def ck_del(key: str):
 # Stable device user_id (cookie, no rerun needed)
 # ============================================================
 def get_or_create_user_id() -> str:
-    uid = ck_get("failog_uid", "").strip()
+    # Streamlit 최신: st.query_params (dict-like)
+    qp = st.query_params
+    uid = (qp.get("uid", "") or "").strip()
+
     if uid:
         st.session_state["user_id"] = uid
         return uid
 
-    # create once and persist
+    # 없으면 생성해서 URL에 박고 rerun
     new_uid = str(uuid.uuid4())
-    ck_set("failog_uid", new_uid)
+    st.query_params["uid"] = new_uid
     st.session_state["user_id"] = new_uid
-    return new_uid
+    st.rerun()
 
 
 # ============================================================
@@ -1731,3 +1734,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
