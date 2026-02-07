@@ -9,3 +9,4 @@ streamlit-cookies-manager
 matplotlib
 reportlab 
 requests
+extra-streamlit-components
