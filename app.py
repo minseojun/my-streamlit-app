@@ -1,18 +1,20 @@
 # app.py
 # ------------------------------------------------------------
-# FAILOG (Device-separated, no-login) - STABLE COOKIE VERSION
-# 목표:
-# ✅ 새로고침/재접속해도 user_id가 절대 안 바뀜 (같은 브라우저/기기 기준)
-# ✅ 쿠키 ready() 같은 불안정 로직 제거 (extra-streamlit-components 사용)
-# ✅ PDF 리포트 한글 깨짐(검은 박스) 해결: 폰트 자동 다운로드 + 임베드
+# FAILOG (No-login, URL-fixed user_id) - FINAL STABLE VERSION
 #
-# Features:
-# A) Open-Meteo 날씨 연동(키 필요 없음)
-# B) 대시보드(주별 원인 트렌드) + 주간 PDF 리포트 내보내기
+# ✅ user_id is fixed via URL query param (?uid=...) so refresh/reopen keeps the same ID
+#    - No cookies/localStorage dependency for identity
+# ✅ Open-Meteo weather (no key)
+# ✅ Failure dashboard:
+#    - No sliders (fixed: trend 8 weeks, top 6)
+#    - OpenAI category clustering/labeling (max 7 categories)
+#    - Category map built from last 12 weeks, cached in DB, refreshable by button
+# ✅ Weekly PDF export (Korean font embedded via auto-download; recommend bundling font in repo)
+# ✅ UI: “red-ish” accents overridden to cream yellow (#FFF2B2) to match blue/white theme
 #
 # Install:
-#   pip install streamlit pandas altair requests reportlab matplotlib openai extra-streamlit-components
-#   (optional) pip install streamlit-autorefresh
+#   pip install streamlit pandas altair requests reportlab matplotlib openai
+#   (optional) pip install streamlit-autorefresh extra-streamlit-components
 #
 # Run:
 #   streamlit run app.py
@@ -25,7 +27,7 @@ import re
 import sqlite3
 import uuid
 from datetime import date, datetime, timedelta, time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import altair as alt
 import matplotlib.pyplot as plt
@@ -34,14 +36,17 @@ import requests
 import streamlit as st
 from zoneinfo import ZoneInfo
 
-# Cookie manager (stable)
-import extra_streamlit_components as stx
-
 # Optional autorefresh
 try:
     from streamlit_autorefresh import st_autorefresh
 except Exception:
     st_autorefresh = None
+
+# Optional cookie manager (prefs only; NOT used for user_id)
+try:
+    import extra_streamlit_components as stx
+except Exception:
+    stx = None
 
 # OpenAI SDK
 try:
@@ -49,7 +54,7 @@ try:
 except Exception:
     OpenAI = None
 
-# PDF
+# PDF (ReportLab)
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import mm
@@ -60,15 +65,28 @@ from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, Tabl
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 
 
+# -------------------------
+# Constants
+# -------------------------
 KST = ZoneInfo("Asia/Seoul")
 DB_PATH = "planner.db"
-ACCENT = "#A0C4F2"
 
+# Theme / colors
+ACCENT_BLUE = "#A0C4F2"
+CREAM_YELLOW = "#FFF2B2"
+CREAM_YELLOW_BORDER = "#E6DCA0"
+TEXT_DARK = "#1f2430"
+
+# Dashboard fixed params (per your request)
+DASH_TREND_WEEKS = 8
+DASH_TOPK = 6
+CATEGORY_MAX = 7
+CATEGORY_MAP_WINDOW_WEEKS = 12
+
+# PDF font
 FONTS_DIR = "fonts"
 KOREAN_FONT_PATH = os.path.join(FONTS_DIR, "NanumGothic-Regular.ttf")
 KOREAN_FONT_NAME = "NanumGothicRegular"
-
-# A known-good TTF file (small enough, permissive license) hosted by Google Fonts
 NANUM_TTF_URL = "https://github.com/google/fonts/raw/main/ofl/nanumgothic/NanumGothic-Regular.ttf"
 
 
@@ -76,9 +94,14 @@ NANUM_TTF_URL = "https://github.com/google/fonts/raw/main/ofl/nanumgothic/NanumG
 # UI / CSS
 # ============================================================
 def inject_css():
+    # NOTE:
+    # Streamlit doesn't expose a perfect "danger button" selector.
+    # Your request: "all red things -> cream yellow".
+    # The safest consistent approach is to force buttons/toggles/active accents to cream yellow.
     st.markdown(
         f"""
 <style>
+/* Layout */
 .block-container {{
   max-width: 1120px;
   padding-top: 1.0rem;
@@ -123,19 +146,100 @@ def inject_css():
   border-color: rgba(160,196,242,0.88);
   color: rgba(31,36,48,0.90);
 }}
+hr {{
+  margin: 1.1rem 0;
+  border: none;
+  border-top: 1px solid rgba(160,196,242,0.35);
+}}
+
+/* Buttons: force cream yellow to remove any red-ish styling */
 div[data-testid="stButton"] > button {{
   border-radius: 14px !important;
   white-space: nowrap !important;
+  background: {CREAM_YELLOW} !important;
+  border: 1px solid {CREAM_YELLOW_BORDER} !important;
+  color: {TEXT_DARK} !important;
+  box-shadow: 0 6px 18px rgba(31,36,48,0.06) !important;
 }}
+div[data-testid="stButton"] > button:hover {{
+  filter: brightness(0.985);
+  border-color: rgba(31,36,48,0.16) !important;
+}}
+div[data-testid="stButton"] > button:active {{
+  transform: translateY(1px);
+}}
+
+/* Inputs */
 [data-testid="stTextInput"] input,
 [data-testid="stTextArea"] textarea {{
   border-radius: 14px !important;
   border: 1px solid rgba(160,196,242,0.55) !important;
 }}
-hr {{
-  margin: 1.1rem 0;
-  border: none;
-  border-top: 1px solid rgba(160,196,242,0.35);
+[data-testid="stTextInput"] input:focus,
+[data-testid="stTextArea"] textarea:focus {{
+  outline: none !important;
+  box-shadow: 0 0 0 4px rgba(255,242,178,0.65) !important; /* cream focus */
+  border-color: rgba(230,220,160,0.95) !important;
+}}
+
+/* Toggle / checkbox accents (best-effort; BaseWeb components) */
+[data-baseweb="checkbox"] input:checked + div {{
+  background: {CREAM_YELLOW} !important;
+  border-color: {CREAM_YELLOW_BORDER} !important;
+}}
+[data-baseweb="checkbox"] svg {{
+  color: {TEXT_DARK} !important;
+}}
+[data-baseweb="toggle"] div[role="switch"][aria-checked="true"] {{
+  background: {CREAM_YELLOW} !important;
+}}
+[data-baseweb="toggle"] div[role="switch"] {{
+  box-shadow: none !important;
+}}
+/* Multi-select selected pills */
+.stMultiSelect span[data-baseweb="tag"] {{
+  background: rgba(255,242,178,0.75) !important;
+  border: 1px solid {CREAM_YELLOW_BORDER} !important;
+  color: {TEXT_DARK} !important;
+}}
+
+/* Hero title */
+.failog-hero {{
+  border: 1px solid rgba(160,196,242,0.60);
+  border-radius: 22px;
+  padding: 18px 18px;
+  background: rgba(255,255,255,0.92);
+  box-shadow: 0 12px 34px rgba(160,196,242,0.14);
+}}
+.failog-title {{
+  font-size: 2.35rem;
+  font-weight: 900;
+  letter-spacing: -0.02em;
+  margin: 0;
+  line-height: 1.12;
+  color: {TEXT_DARK};
+}}
+.failog-sub {{
+  margin-top: 6px;
+  color: rgba(31,36,48,0.66);
+  font-size: 1.02rem;
+}}
+.failog-badges {{
+  margin-top: 10px;
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}}
+.failog-badge {{
+  display:inline-flex;
+  align-items:center;
+  gap:6px;
+  padding: 5px 10px;
+  border-radius: 999px;
+  background: rgba(255,242,178,0.55);
+  border: 1px solid {CREAM_YELLOW_BORDER};
+  font-size: 0.86rem;
+  color: rgba(31,36,48,0.80);
 }}
 </style>
 """,
@@ -143,33 +247,72 @@ hr {{
     )
 
 
+def render_hero():
+    st.markdown(
+        f"""
+<div class="failog-hero">
+  <div class="failog-title">FAILOG</div>
+  <div class="failog-sub">실패를 성공으로 — 계획과 습관의 실패를 기록하고, 패턴을 이해하고, 다음 주를 설계해요.</div>
+  <div class="failog-badges">
+    <span class="failog-badge">🌤️ Weather (Open-Meteo)</span>
+    <span class="failog-badge">📊 Trend Dashboard</span>
+    <span class="failog-badge">🧾 Weekly PDF</span>
+    <span class="failog-badge">🧠 AI Categorization</span>
+  </div>
+</div>
+""",
+        unsafe_allow_html=True,
+    )
+    st.write("")
+
+
 # ============================================================
-# Cookies (stable)
+# URL-fixed user_id
 # ============================================================
-def cookie_mgr() -> stx.CookieManager:
+def get_or_create_user_id() -> str:
+    # Streamlit query params are persistent across refresh
+    qp = st.query_params
+    uid = (qp.get("uid", "") or "").strip()
+    if uid:
+        st.session_state["user_id"] = uid
+        return uid
+
+    new_uid = str(uuid.uuid4())
+    st.query_params["uid"] = new_uid
+    st.session_state["user_id"] = new_uid
+    st.rerun()
+
+
+# ============================================================
+# Cookies (prefs only; best-effort)
+# ============================================================
+def cookie_mgr():
+    if stx is None:
+        return None
     if "x_cookie_mgr" not in st.session_state:
         st.session_state["x_cookie_mgr"] = stx.CookieManager()
     return st.session_state["x_cookie_mgr"]
 
 
 def ck_get(key: str, default: str = "") -> str:
+    cm = cookie_mgr()
+    if cm is None:
+        return default
     try:
-        v = cookie_mgr().get(key)
+        v = cm.get(key)
         return default if v is None else str(v)
     except Exception:
         return default
 
 
 def ck_set(key: str, value: str, expires_days: int = 3650):
-    """
-    extra-streamlit-components CookieManager는 버전별로 set() 시그니처가 조금 다를 수 있어
-    안전하게 여러 형태로 시도한다.
-    """
     cm = cookie_mgr()
+    if cm is None:
+        return
     v = "" if value is None else str(value)
     try:
         # Some versions support expires_at_days
-        if "expires_at_days" in cm.set.__code__.co_varnames:
+        if hasattr(cm, "set") and "expires_at_days" in cm.set.__code__.co_varnames:
             cm.set(key, v, expires_at_days=int(expires_days))
         else:
             cm.set(key, v)
@@ -182,6 +325,8 @@ def ck_set(key: str, value: str, expires_days: int = 3650):
 
 def ck_del(key: str):
     cm = cookie_mgr()
+    if cm is None:
+        return
     for fn in ("delete", "remove", "delete_cookie"):
         if hasattr(cm, fn):
             try:
@@ -189,30 +334,10 @@ def ck_del(key: str):
                 return
             except Exception:
                 pass
-    # fallback: set empty
     try:
         cm.set(key, "")
     except Exception:
         pass
-
-
-# ============================================================
-# Stable device user_id (cookie, no rerun needed)
-# ============================================================
-def get_or_create_user_id() -> str:
-    # Streamlit 최신: st.query_params (dict-like)
-    qp = st.query_params
-    uid = (qp.get("uid", "") or "").strip()
-
-    if uid:
-        st.session_state["user_id"] = uid
-        return uid
-
-    # 없으면 생성해서 URL에 박고 rerun
-    new_uid = str(uuid.uuid4())
-    st.query_params["uid"] = new_uid
-    st.session_state["user_id"] = new_uid
-    st.rerun()
 
 
 # ============================================================
@@ -231,6 +356,7 @@ def now_iso() -> str:
 def init_db():
     c = conn()
     cur = c.cursor()
+
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS habits (
@@ -244,6 +370,7 @@ def init_db():
         );
         """
     )
+
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS tasks (
@@ -261,12 +388,27 @@ def init_db():
         );
         """
     )
+
+    # Category map cache (per user)
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS category_maps (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          user_id TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          window_weeks INTEGER NOT NULL,
+          max_categories INTEGER NOT NULL,
+          payload_json TEXT NOT NULL
+        );
+        """
+    )
+
     c.commit()
     c.close()
 
 
 # ============================================================
-# Date helpers (Mon-Sun)
+# Date helpers
 # ============================================================
 def week_start(d: date) -> date:
     return d - timedelta(days=d.weekday())
@@ -505,7 +647,7 @@ def count_today_todos(user_id: str) -> int:
 
 
 # ============================================================
-# Reminder (cookie)
+# Reminder (prefs)
 # ============================================================
 def parse_hhmm(s: str) -> time:
     s = (s or "").strip()
@@ -525,7 +667,7 @@ def should_remind(now_dt: datetime, remind_t: time, window_min: int) -> bool:
 
 
 # ============================================================
-# OpenAI (cookie)
+# OpenAI (for coaching + categorization)
 # ============================================================
 def openai_client(api_key: str):
     if OpenAI is None:
@@ -535,32 +677,33 @@ def openai_client(api_key: str):
     return OpenAI(api_key=api_key.strip())
 
 
-def ck_openai_key() -> str:
+def prefs_openai_key() -> str:
+    # best-effort cookie; if cookie blocked => empty
     return ck_get("failog_openai_key", "").strip()
 
 
-def ck_openai_model() -> str:
+def prefs_openai_model() -> str:
     m = ck_get("failog_openai_model", "gpt-4o-mini").strip()
     return m if m else "gpt-4o-mini"
 
 
 def effective_openai_key() -> str:
     sk = st.session_state.get("openai_api_key", "")
-    return sk.strip() if sk and sk.strip() else ck_openai_key()
+    return sk.strip() if sk and sk.strip() else prefs_openai_key()
 
 
 def effective_openai_model() -> str:
     sm = st.session_state.get("openai_model", "")
-    return sm.strip() if sm and sm.strip() else ck_openai_model()
+    return sm.strip() if sm and sm.strip() else prefs_openai_model()
 
 
-def set_ck_openai(api_key: str, model: str):
+def set_prefs_openai(api_key: str, model: str):
     ck_set("failog_openai_key", (api_key or "").strip())
     ck_set("failog_openai_model", (model or "gpt-4o-mini").strip())
 
 
 # ============================================================
-# Coaching prompt
+# Coaching prompts
 # ============================================================
 BASE_COACH_PROMPT = (
     "사용자의 계획 실패 이유 목록을 분석해 공통 원인을 3가지 이내로 분류하고, "
@@ -749,7 +892,195 @@ def llm_chat(api_key: str, model: str, system_context: str, msgs: List[Dict[str,
 
 
 # ============================================================
-# A) Open-Meteo Weather (no key)
+# OpenAI Categorization (Dashboard)
+# ============================================================
+CATEGORY_SCHEMA = """
+반드시 JSON만 출력.
+형식:
+{
+  "categories": [
+    {
+      "name": "카테고리명(짧게)",
+      "definition": "이 카테고리에 포함되는 실패 원인의 특징(1문장)",
+      "examples": ["원문 예시1","원문 예시2"]
+    }
+  ],
+  "mapping": {
+    "원문 실패원인": "카테고리명",
+    "또다른 원문": "카테고리명"
+  }
+}
+규칙:
+- categories 최대 {max_categories}개
+- mapping의 키는 반드시 입력 원문 목록에 존재하는 문자열 그대로
+- mapping 값은 categories[].name 중 하나
+- 애매하면 '기타' 카테고리를 하나 포함해도 됨 (그 경우 name='기타')
+""".strip()
+
+
+def list_recent_failure_reasons(user_id: str, weeks: int) -> List[str]:
+    end = date.today()
+    start = end - timedelta(days=7 * weeks - 1)
+    df = get_tasks_range(user_id, start, end)
+    if df.empty:
+        return []
+    f = df[df["status"] == "fail"].copy()
+    if f.empty:
+        return []
+    reasons = f["fail_reason"].fillna("").map(lambda v: str(v).strip())
+    reasons = reasons[reasons != ""]
+    # unique but keep stable ordering by frequency then alpha for stability
+    if reasons.empty:
+        return []
+    vc = reasons.value_counts()
+    ordered = vc.index.tolist()
+    return ordered
+
+
+def llm_build_category_map(api_key: str, model: str, reasons: List[str], max_categories: int) -> Dict[str, Any]:
+    client = openai_client(api_key)
+
+    # Guardrail: limit payload size
+    reasons_limited = reasons[:120]
+
+    prompt = f"""
+너는 사용자의 '실패 원인' 텍스트들을 비슷한 것끼리 묶어 카테고리로 분류해.
+목표:
+- 사용자 표현이 다양해도 의미가 비슷하면 같은 카테고리로 묶기
+- 카테고리명은 짧고 직관적으로
+- 전체 카테고리는 최대 {max_categories}개
+- 가능한 한 '기타'는 최소화하되, 정말 애매하면 '기타'를 포함해도 됨
+
+실패 원인 원문 목록:
+{json.dumps(reasons_limited, ensure_ascii=False, indent=2)}
+
+{CATEGORY_SCHEMA.format(max_categories=max_categories)}
+""".strip()
+
+    resp = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": "Return valid JSON only."},
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0.35,
+    )
+    text = (resp.choices[0].message.content or "").strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        m = re.search(r"\{.*\}", text, flags=re.DOTALL)
+        return json.loads(m.group(0)) if m else {"categories": [], "mapping": {}}
+
+
+def db_get_latest_category_map(user_id: str) -> Optional[Dict[str, Any]]:
+    c = conn()
+    row = c.execute(
+        """
+        SELECT payload_json
+        FROM category_maps
+        WHERE user_id=?
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (user_id,),
+    ).fetchone()
+    c.close()
+    if not row:
+        return None
+    try:
+        return json.loads(row[0])
+    except Exception:
+        return None
+
+
+def db_save_category_map(user_id: str, payload: Dict[str, Any], window_weeks: int, max_categories: int):
+    c = conn()
+    c.execute(
+        """
+        INSERT INTO category_maps(user_id, created_at, window_weeks, max_categories, payload_json)
+        VALUES (?,?,?,?,?)
+        """,
+        (user_id, now_iso(), int(window_weeks), int(max_categories), json.dumps(payload, ensure_ascii=False)),
+    )
+    c.commit()
+    c.close()
+
+
+def get_or_build_category_map(user_id: str, api_key: str, model: str, force_refresh: bool = False) -> Tuple[Optional[Dict[str, Any]], str]:
+    """
+    Returns: (map_payload_or_none, status_msg)
+    """
+    if not force_refresh:
+        cached = db_get_latest_category_map(user_id)
+        if cached and isinstance(cached, dict) and "mapping" in cached:
+            return cached, "캐시된 카테고리 맵을 사용 중"
+
+    reasons = list_recent_failure_reasons(user_id, weeks=CATEGORY_MAP_WINDOW_WEEKS)
+    if len(reasons) < 4:
+        return None, "최근 12주 실패 원인 텍스트가 부족해요(최소 4개 필요)."
+
+    payload = llm_build_category_map(api_key, model, reasons, max_categories=CATEGORY_MAX)
+
+    # basic validation: ensure mapping keys are subset of reasons
+    mapping = payload.get("mapping", {}) if isinstance(payload, dict) else {}
+    if not isinstance(mapping, dict) or len(mapping) == 0:
+        return None, "카테고리 맵 생성 결과가 비어 있어요. 다시 시도해 주세요."
+
+    # save and return
+    db_save_category_map(user_id, payload, window_weeks=CATEGORY_MAP_WINDOW_WEEKS, max_categories=CATEGORY_MAX)
+    return payload, "카테고리 맵을 새로 만들었어요"
+
+
+def apply_category_mapping(df_fail: pd.DataFrame, mapping: Dict[str, str]) -> pd.DataFrame:
+    x = df_fail.copy()
+    x["reason_raw"] = x["fail_reason"].fillna("").map(lambda v: str(v).strip())
+    x["category"] = x["reason_raw"].map(lambda r: mapping.get(r, "기타"))
+    x.loc[x["reason_raw"] == "", "category"] = "기타"
+    return x
+
+
+def weekly_category_trend(user_id: str, weeks: int, topk: int, mapping: Dict[str, str]) -> pd.DataFrame:
+    """
+    Returns df with columns: week, category, count (int)
+    """
+    end = date.today()
+    start = end - timedelta(days=7 * weeks - 1)
+    df = get_tasks_range(user_id, start, end)
+    if df.empty:
+        return pd.DataFrame(columns=["week", "category", "count"])
+
+    df = df.copy()
+    df["task_date"] = pd.to_datetime(df["task_date"]).dt.date
+    df = df[df["status"] == "fail"].copy()
+    if df.empty:
+        return pd.DataFrame(columns=["week", "category", "count"])
+
+    df = apply_category_mapping(df, mapping)
+    df["week"] = df["task_date"].map(lambda d: week_start(d).isoformat())
+
+    # choose top categories by total count in window (excluding empty)
+    totals = df.groupby("category").size().sort_values(ascending=False)
+    top_categories = totals.head(topk).index.tolist()
+
+    df = df[df["category"].isin(top_categories)].copy()
+    out = df.groupby(["week", "category"]).size().reset_index(name="count")
+    out["count"] = out["count"].astype(int)
+
+    # ensure all week/category combinations exist (fill missing with 0) for cleaner lines
+    weeks_sorted = sorted(out["week"].unique().tolist())
+    all_rows = []
+    for w in weeks_sorted:
+        for cat in top_categories:
+            sub = out[(out["week"] == w) & (out["category"] == cat)]
+            cnt = int(sub["count"].iloc[0]) if not sub.empty else 0
+            all_rows.append({"week": w, "category": cat, "count": cnt})
+    out2 = pd.DataFrame(all_rows)
+    return out2
+
+
+# ============================================================
+# Open-Meteo Weather (no key)
 # ============================================================
 WEATHER_CODE_KO = {
     0: "맑음",
@@ -773,6 +1104,7 @@ WEATHER_CODE_KO = {
     95: "뇌우",
 }
 
+
 @st.cache_data(ttl=60 * 60, show_spinner=False)
 def geocode_city(city_name: str) -> Optional[Dict[str, Any]]:
     city_name = (city_name or "").strip()
@@ -785,6 +1117,7 @@ def geocode_city(city_name: str) -> Optional[Dict[str, Any]]:
     js = r.json()
     results = js.get("results") or []
     return results[0] if results else None
+
 
 @st.cache_data(ttl=60 * 30, show_spinner=False)
 def fetch_daily_weather(lat: float, lon: float, d: date, tz: str = "Asia/Seoul") -> Optional[Dict[str, Any]]:
@@ -821,6 +1154,7 @@ def fetch_daily_weather(lat: float, lon: float, d: date, tz: str = "Asia/Seoul")
         "precip_sum": psum,
         "precip_prob": pprob,
     }
+
 
 def weather_card(selected: date):
     st.markdown("<div class='card'>", unsafe_allow_html=True)
@@ -881,12 +1215,13 @@ def weather_card(selected: date):
 
 
 # ============================================================
-# B) Weekly PDF report + Dashboard (Korean font fixed)
+# PDF: Korean font embedding
 # ============================================================
 def ensure_korean_font_downloaded() -> bool:
     """
-    한글 깨짐(검은 박스) 방지를 위해 TTF를 프로젝트 로컬에 확보.
-    - 로컬에 없으면 GitHub(google/fonts)에서 다운로드 시도
+    Ensure a Korean TTF exists locally for embedding into PDF.
+    Best practice: commit font into repo at fonts/NanumGothic-Regular.ttf
+    Fallback: auto-download (may fail if network blocked).
     """
     try:
         os.makedirs(FONTS_DIR, exist_ok=True)
@@ -903,9 +1238,6 @@ def ensure_korean_font_downloaded() -> bool:
 
 
 def register_korean_font() -> str:
-    """
-    ReportLab에 폰트를 등록해서 PDF에 임베드(=한글 깨짐 방지).
-    """
     if st.session_state.get("__pdf_font_registered__", False):
         return st.session_state.get("__pdf_font_name__", "Helvetica")
 
@@ -919,7 +1251,6 @@ def register_korean_font() -> str:
         except Exception:
             pass
 
-    # fallback (한글 깨질 수 있으니 경고는 UI에서 별도로)
     st.session_state["__pdf_font_registered__"] = True
     st.session_state["__pdf_font_name__"] = "Helvetica"
     return "Helvetica"
@@ -948,34 +1279,11 @@ def top_reasons(df: pd.DataFrame, topk: int = 8) -> pd.DataFrame:
     return pd.DataFrame({"reason": vc.index.tolist(), "count": vc.values.tolist()})
 
 
-def weekly_reason_trend(user_id: str, weeks: int = 12, topk: int = 6) -> pd.DataFrame:
-    end = date.today()
-    start = end - timedelta(days=7 * weeks - 1)
-    df = get_tasks_range(user_id, start, end)
-    if df.empty:
-        return pd.DataFrame(columns=["week", "reason", "count"])
-
-    df = df.copy()
-    df["task_date"] = pd.to_datetime(df["task_date"]).dt.date
-    df = df[df["status"] == "fail"].copy()
-    df["reason"] = df["fail_reason"].fillna("").map(lambda v: str(v).strip())
-    df = df[df["reason"] != ""]
-    if df.empty:
-        return pd.DataFrame(columns=["week", "reason", "count"])
-
-    top = df["reason"].value_counts().head(topk).index.tolist()
-    df = df[df["reason"].isin(top)].copy()
-
-    df["week"] = df["task_date"].map(lambda d: week_start(d).isoformat())
-    out = df.groupby(["week", "reason"]).size().reset_index(name="count").sort_values(["week", "count"], ascending=[True, False])
-    return out
-
-
 def make_matplotlib_bar_png(data: pd.DataFrame, xcol: str, ycol: str, title: str) -> bytes:
     fig = plt.figure(figsize=(6.2, 2.4), dpi=160)
     ax = fig.add_subplot(111)
     ax.bar(data[xcol].tolist(), data[ycol].tolist())
-    ax.set_title(title)  # 영어로 유지(폰트 이슈 회피)
+    ax.set_title(title)  # keep simple; PDF text uses ReportLab font anyway
     ax.set_xlabel("")
     ax.set_ylabel("")
     fig.tight_layout()
@@ -1031,7 +1339,7 @@ def build_weekly_pdf_bytes(user_id: str, ws: date, city_label: str = "") -> byte
         TableStyle(
             [
                 ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#EAF3FF")),
-                ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor("#1f2430")),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor(TEXT_DARK)),
                 ("FONTNAME", (0, 0), (-1, -1), font_name),
                 ("FONTSIZE", (0, 0), (-1, -1), 10),
                 ("ALIGN", (0, 0), (-1, -1), "CENTER"),
@@ -1116,7 +1424,7 @@ def screen_planner(user_id: str):
     ws = week_start(selected)
     ensure_week_habit_tasks(user_id, ws)
 
-    # Reminder settings in cookie
+    # Reminder settings (prefs)
     en = (ck_get("failog_rem_enabled", "true").lower() == "true")
     rt_str = ck_get("failog_rem_time", "21:30")
     win_str = ck_get("failog_rem_win", "15")
@@ -1150,7 +1458,7 @@ def screen_planner(user_id: str):
                 st.rerun()
         with nav[1]:
             st.markdown(
-                f"<div style='text-align:center; font-weight:700; font-size:1.05rem;'>{y}.{m:02d}</div>",
+                f"<div style='text-align:center; font-weight:800; font-size:1.05rem;'>{y}.{m:02d}</div>",
                 unsafe_allow_html=True,
             )
         with nav[2]:
@@ -1301,7 +1609,7 @@ def screen_planner(user_id: str):
                         st.caption(f"실패 원인: {reason}")
 
                 with top[1]:
-                    if st.button("성공", key=f"s_{tid}", use_container_width=True, type="primary"):
+                    if st.button("성공", key=f"s_{tid}", use_container_width=True):
                         update_task_status(user_id, tid, "success")
                         st.session_state.pop(f"show_fail_{tid}", None)
                         st.rerun()
@@ -1320,7 +1628,7 @@ def screen_planner(user_id: str):
                     reason_in = st.text_input("실패 원인(한 문장)", value=reason, key=f"r_{tid}")
                     a, b = st.columns([1, 4], gap="small")
                     with a:
-                        if st.button("저장", key=f"save_fail_{tid}", use_container_width=True, type="primary"):
+                        if st.button("저장", key=f"save_fail_{tid}", use_container_width=True):
                             update_task_fail(user_id, tid, reason_in)
                             st.session_state[f"show_fail_{tid}"] = False
                             st.rerun()
@@ -1349,7 +1657,10 @@ def screen_failures(user_id: str):
             st.session_state["fail_week_offset"] += 1
             st.rerun()
     with nav[1]:
-        st.markdown(f"<div style='text-align:center; font-weight:700;'>{ws.isoformat()} ~ {we.isoformat()}</div>", unsafe_allow_html=True)
+        st.markdown(
+            f"<div style='text-align:center; font-weight:800;'>{ws.isoformat()} ~ {we.isoformat()}</div>",
+            unsafe_allow_html=True,
+        )
     with nav[2]:
         if st.button("〉", use_container_width=True, key="fw_next", disabled=(offset == 0)):
             st.session_state["fail_week_offset"] = max(0, offset - 1)
@@ -1366,18 +1677,22 @@ def screen_failures(user_id: str):
 
     tab1, tab2, tab3 = st.tabs(["대시보드", "주간 분석/코칭", "PDF 리포트"])
 
+    # -------------------------
+    # Dashboard
+    # -------------------------
     with tab1:
         st.markdown("<div class='card'>", unsafe_allow_html=True)
-        st.markdown("### 📊 Dashboard (주별 원인 트렌드)")
+        st.markdown("### 📊 Dashboard")
 
-        colA, colB = st.columns([1.2, 1.0])
-        with colA:
-            weeks = st.slider("기간(주)", min_value=4, max_value=24, value=12, step=1, key="dash_weeks")
-        with colB:
-            topk = st.slider("원인 TOP", min_value=3, max_value=10, value=6, step=1, key="dash_topk")
+        st.caption(f"트렌드: 최근 {DASH_TREND_WEEKS}주 · 표시: TOP {DASH_TOPK} 카테고리 · 카테고리 맵: 최근 {CATEGORY_MAP_WINDOW_WEEKS}주 기반 (최대 {CATEGORY_MAX}개)")
 
+        api_key = effective_openai_key()
+        model = effective_openai_model()
+
+        # Fail by DOW (this week)
+        st.markdown("**이번 주 실패(요일 분포)**")
         dow_df = failures_by_dow(df)
-        c = (
+        c_dow = (
             alt.Chart(dow_df)
             .mark_bar()
             .encode(
@@ -1387,29 +1702,83 @@ def screen_failures(user_id: str):
             )
             .properties(height=160)
         )
-        st.markdown("**이번 주 실패(요일 분포)**")
-        st.altair_chart(c, use_container_width=True)
+        st.altair_chart(c_dow, use_container_width=True)
 
-        trend = weekly_reason_trend(user_id, weeks=weeks, topk=topk)
+        st.markdown("<hr/>", unsafe_allow_html=True)
+        st.markdown("**실패 원인 트렌드(주별, 카테고리)**")
+
+        if not api_key:
+            st.info("OpenAI 키가 설정되면 ‘카테고리 트렌드’가 표시돼요. (하단 OpenAI 설정)")
+            st.markdown("</div>", unsafe_allow_html=True)
+            return
+
+        colA, colB = st.columns([1.2, 2.8])
+        with colA:
+            refresh = st.button("카테고리 맵 갱신", use_container_width=True, key="cat_map_refresh")
+        with colB:
+            st.caption("갱신을 누르면 최근 12주 실패 원인을 다시 묶어(최대 7개) 카테고리 맵을 업데이트해요.")
+
+        try:
+            with st.spinner("카테고리 맵 확인 중..."):
+                cat_map, msg = get_or_build_category_map(user_id, api_key, model, force_refresh=bool(refresh))
+        except Exception as e:
+            st.error(f"카테고리 맵 처리 실패: {type(e).__name__}")
+            st.markdown("</div>", unsafe_allow_html=True)
+            return
+
+        st.caption(msg)
+
+        if not cat_map:
+            st.info("카테고리 맵이 아직 없어요. 실패 원인 텍스트가 더 쌓이면 자동으로 만들 수 있어요.")
+            st.markdown("</div>", unsafe_allow_html=True)
+            return
+
+        mapping = cat_map.get("mapping", {}) if isinstance(cat_map, dict) else {}
+        categories = cat_map.get("categories", []) if isinstance(cat_map, dict) else []
+
+        if isinstance(categories, list) and categories:
+            with st.expander("카테고리 정의 보기", expanded=False):
+                for cdef in categories[:CATEGORY_MAX]:
+                    name = str(cdef.get("name", "카테고리"))
+                    definition = str(cdef.get("definition", ""))
+                    examples = cdef.get("examples", []) or []
+                    st.markdown(f"**• {name}**")
+                    if definition:
+                        st.write(definition)
+                    if examples:
+                        st.write("- 예시:", ", ".join([str(x) for x in examples[:3]]))
+
+        # Trend chart (8 weeks, top 6)
+        trend = weekly_category_trend(user_id, weeks=DASH_TREND_WEEKS, topk=DASH_TOPK, mapping=mapping)
+
         if trend.empty:
-            st.info("최근 기간에 ‘실패 원인 텍스트’가 부족해서 트렌드를 만들 수 없어요.")
-        else:
-            st.markdown("**실패 원인 트렌드(주별)**")
-            c2 = (
-                alt.Chart(trend)
-                .mark_line(point=True)
-                .encode(
-                    x=alt.X("week:N", title=None, sort=sorted(trend["week"].unique().tolist())),
-                    y=alt.Y("count:Q", title=None),
-                    color=alt.Color("reason:N", title="원인"),
-                    tooltip=["week", "reason", "count"],
-                )
-                .properties(height=240)
+            st.info("최근 기간에 실패 원인 데이터가 부족해서 트렌드를 만들 수 없어요.")
+            st.markdown("</div>", unsafe_allow_html=True)
+            return
+
+        # Force integer y axis feel
+        y_axis = alt.Axis(title="실패 횟수", tickMinStep=1)
+
+        c_trend = (
+            alt.Chart(trend)
+            .mark_line(point=True)
+            .encode(
+                x=alt.X("week:N", title="주 시작일(월)", sort=sorted(trend["week"].unique().tolist())),
+                y=alt.Y("count:Q", title="실패 횟수", axis=y_axis),
+                color=alt.Color("category:N", title="카테고리"),
+                tooltip=["week", "category", "count"],
             )
-            st.altair_chart(c2, use_container_width=True)
+            .properties(height=260)
+        )
+        st.altair_chart(c_trend, use_container_width=True)
+
+        st.caption("X축: 주 시작일(월요일) · Y축: 그 주에 해당 카테고리로 기록된 실패 원인 횟수(실제 횟수)")
 
         st.markdown("</div>", unsafe_allow_html=True)
 
+    # -------------------------
+    # Weekly analysis / coaching
+    # -------------------------
     with tab2:
         st.markdown("<div class='card'>", unsafe_allow_html=True)
         st.markdown("### 주간 실패 차트")
@@ -1443,7 +1812,7 @@ def screen_failures(user_id: str):
         elif len(weekly_reasons) == 0:
             st.write("이번 주에는 실패 원인 입력이 아직 없어요.")
         else:
-            if st.button("분석 생성/갱신", use_container_width=True, key="weekly_analyze", type="primary"):
+            if st.button("분석 생성/갱신", use_container_width=True, key="weekly_analyze"):
                 try:
                     st.session_state["weekly_analysis"] = llm_weekly_reason_analysis(api_key, model, weekly_reasons)
                 except Exception as e:
@@ -1493,7 +1862,7 @@ def screen_failures(user_id: str):
 
         signals = compute_user_signals(user_id, days=28)
 
-        if st.button("코칭 생성/갱신", use_container_width=True, key="overall_coach_btn", type="primary"):
+        if st.button("코칭 생성/갱신", use_container_width=True, key="overall_coach_btn"):
             try:
                 st.session_state["overall_coach"] = llm_overall_coaching(api_key, model, items, signals)
             except Exception as e:
@@ -1516,6 +1885,8 @@ def screen_failures(user_id: str):
                         st.markdown("**2주+ 반복이면: 창의적 대안**")
                         for tip in creative[:3]:
                             st.write(f"- {tip}")
+        else:
+            st.caption("‘코칭 생성/갱신’을 눌러 코칭을 받아보세요.")
 
         st.markdown("<hr/>", unsafe_allow_html=True)
 
@@ -1567,10 +1938,14 @@ def screen_failures(user_id: str):
 
         st.markdown("</div>", unsafe_allow_html=True)
 
+    # -------------------------
+    # PDF report
+    # -------------------------
     with tab3:
         st.markdown("<div class='card'>", unsafe_allow_html=True)
-        st.markdown("### 🧾 Weekly PDF 리포트 (한글 폰트 자동 포함)")
-        st.caption("PDF에서 한글이 네모로 나오면: 폰트 다운로드가 막힌 환경일 수 있어요(네트워크 제한 등).")
+        st.markdown("### 🧾 Weekly PDF 리포트 (한글 폰트 포함)")
+
+        st.caption("가장 확실한 방법: fonts/NanumGothic-Regular.ttf 를 레포에 포함하면(커밋) 네모(■) 깨짐이 100% 사라져요.")
 
         city = ck_get("failog_city", "").strip()
         city_label = ""
@@ -1582,10 +1957,9 @@ def screen_failures(user_id: str):
         except Exception:
             city_label = city
 
-        # 미리 폰트 준비 시도 + 상태 표시
         font_ready = ensure_korean_font_downloaded()
         if not font_ready:
-            st.warning("한글 폰트 다운로드에 실패했어요. 네트워크 제한이 있으면 리포트 한글이 깨질 수 있어요.")
+            st.warning("폰트 다운로드가 막힌 환경이면 PDF 한글이 깨질 수 있어요. (레포에 폰트 파일 포함 권장)")
         else:
             st.success("PDF 한글 폰트 준비 완료")
 
@@ -1598,7 +1972,7 @@ def screen_failures(user_id: str):
         with c3:
             st.write("")
             st.write("")
-            gen = st.button("PDF 생성", use_container_width=True, type="primary", key="pdf_gen")
+            gen = st.button("PDF 생성", use_container_width=True, key="pdf_gen")
 
         if gen:
             with st.spinner("PDF 생성 중..."):
@@ -1617,14 +1991,14 @@ def screen_failures(user_id: str):
 
 
 # ============================================================
-# Bottom OpenAI panel (cookie)
+# Bottom OpenAI panel (prefs)
 # ============================================================
 def render_openai_bottom_panel():
     st.markdown("<hr/>", unsafe_allow_html=True)
-    st.markdown("### 🔑 OpenAI 설정 (쿠키 저장 옵션)")
+    st.markdown("### 🔑 OpenAI 설정")
 
-    default_key = ck_openai_key()
-    default_model = ck_openai_model()
+    default_key = prefs_openai_key()
+    default_model = prefs_openai_model()
 
     col1, col2, col3 = st.columns([3.0, 1.6, 1.4])
     with col1:
@@ -1643,16 +2017,16 @@ def render_openai_bottom_panel():
         )
     with col3:
         save_default = (default_key.strip() != "")
-        save = st.toggle("쿠키 저장", value=save_default, help="같은 브라우저에서 유지돼요.", key="bottom_openai_save")
+        save = st.toggle("쿠키 저장", value=save_default, help="같은 브라우저에서 유지돼요. (쿠키가 막히면 저장 안 될 수 있어요)", key="bottom_openai_save")
 
     a, b, c = st.columns([1, 1, 3])
     with a:
-        if st.button("적용", use_container_width=True, key="bottom_apply", type="primary"):
+        if st.button("적용", use_container_width=True, key="bottom_apply"):
             st.session_state["openai_api_key"] = (api_key or "").strip()
             st.session_state["openai_model"] = (model or "gpt-4o-mini").strip()
 
             if save:
-                set_ck_openai(api_key or "", model or "gpt-4o-mini")
+                set_prefs_openai(api_key or "", model or "gpt-4o-mini")
             else:
                 ck_del("failog_openai_key")
                 ck_set("failog_openai_model", (model or "gpt-4o-mini").strip())
@@ -1662,10 +2036,10 @@ def render_openai_bottom_panel():
         if st.button("저장값 삭제", use_container_width=True, key="bottom_clear"):
             ck_del("failog_openai_key")
             ck_del("failog_openai_model")
-            st.success("쿠키 저장값을 삭제했어요.")
+            st.success("저장값을 삭제했어요.")
             st.rerun()
     with c:
-        st.caption("쿠키 저장을 켜면 새로고침/재접속해도 유지돼요. (공유 PC에서는 끄세요)")
+        st.caption("user_id는 URL(uid)로 고정되어 있고, OpenAI 키는 선택적으로 쿠키에 저장됩니다.")
 
 
 # ============================================================
@@ -1681,16 +2055,14 @@ def top_nav():
             " Planner",
             use_container_width=True,
             key="nav_plan",
-            type="primary" if st.session_state["screen"] == "planner" else "secondary",
         ):
             st.session_state["screen"] = "planner"
             st.rerun()
     with c2:
         if st.button(
-            "Failure Report",
+            " Failure Report",
             use_container_width=True,
             key="nav_fail",
-            type="primary" if st.session_state["screen"] == "fail" else "secondary",
         ):
             st.session_state["screen"] = "fail"
             st.rerun()
@@ -1707,21 +2079,10 @@ def main():
     inject_css()
     init_db()
 
-    # IMPORTANT: cookie manager MUST be instantiated (component render)
-    _ = cookie_mgr()
-
-    # Stable user_id (same browser/device => never changes)
+    # user_id is fixed via URL query param
     user_id = get_or_create_user_id()
 
-    st.markdown("# FAILOG")
-    st.markdown(
-        "<div class='small'>실패를 성공으로! 계획과 습관의 실패를 기록하고 맞춤형 코칭을 받아보자</div>",
-        unsafe_allow_html=True,
-    )
-    st.write("")
-
-    # Debug (optional): show short uid to confirm stability
-    st.caption(f"device id: {user_id[:8]}… (same browser stays same)")
+    render_hero()
 
     screen = top_nav()
     if screen == "planner":
@@ -1734,4 +2095,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
