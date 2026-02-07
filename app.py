@@ -78,8 +78,19 @@ def cookies() -> EncryptedCookieManager:
             password="CHANGE_THIS_TO_A_RANDOM_LONG_SECRET_32CHARS_PLUS",
         )
     mgr = st.session_state["cookie_mgr"]
+
     if not mgr.ready():
+        st.markdown("<div class='card'>", unsafe_allow_html=True)
+        st.info("쿠키 초기화 중이에요. 잠시만요… (자동으로 다시 시도합니다)")
+        st.markdown("</div>", unsafe_allow_html=True)
+
+        # 한 번만 rerun
+        if not st.session_state.get("__cookie_retry__", False):
+            st.session_state["__cookie_retry__"] = True
+            st.rerun()
+
         st.stop()
+
     return mgr
 
 
@@ -1693,3 +1704,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
