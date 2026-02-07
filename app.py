@@ -1,13 +1,19 @@
 # app.py
 # ------------------------------------------------------------
-# FAILOG (Device-separated, no-login) - COOKIE VERSION
+# FAILOG (Device-separated, no-login) - COOKIE VERSION (READY-SAFE)
 # ✅ Same browser/device: refresh/reopen keeps everything (user_id + settings)
 # ✅ Different browser/device: completely different app instance (different user_id)
 #
 # Key fix:
-# - localStorage 제거
-# - cookie 기반 user_id 고정
-# - OpenAI 설정/리마인더/도시 설정도 cookie로 저장 (선택 저장 토글)
+# - localStorage 완전 제거
+# - streamlit-cookies-manager의 CookiesNotReady 루프 방지:
+#   - ready() 되기 전에는 쿠키 get/set/del 절대 호출하지 않음
+#   - ready 전에는 임시 session uid로 UI를 "끝까지" 렌더해 ready가 뜨게 함
+#   - ready 되는 순간 cookie uid를 고정 저장하고 rerun
+#
+# Features added (per your request):
+# A) Open-Meteo 날씨 연동 (키 필요 없음)
+# B) 주간 PDF 리포트 내보내기 + 대시보드(요일/원인 트렌드)
 #
 # Install:
 #   pip install streamlit pandas altair openai requests reportlab matplotlib streamlit-cookies-manager
@@ -35,6 +41,7 @@ import requests
 
 # Cookies
 from streamlit_cookies_manager import EncryptedCookieManager
+from streamlit_cookies_manager.cookie_manager import CookiesNotReady
 
 # Optional autorefresh
 try:
@@ -65,18 +72,19 @@ KST = ZoneInfo("Asia/Seoul")
 DB_PATH = "planner.db"
 ACCENT = "#A0C4F2"
 
-# -------------------------
-# Cookies (IMPORTANT)
-# -------------------------
-# NOTE:
-# - EncryptedCookieManager는 쿠키 값을 암호화해 저장 (브라우저에 저장되지만 평문 노출이 덜함)
-# - OpenAI 키를 쿠키에 저장하는 것은 보안상 민감할 수 있어요. "저장 토글"로만 저장하도록 해둠.
+# ============================================================
+# ✅ COOKIES (READY-SAFE)
+# ============================================================
+# IMPORTANT:
+# - 아래 password는 반드시 프로젝트에서 "충분히 긴 랜덤 문자열"로 바꾸세요.
+# - OpenAI 키를 쿠키에 저장하는 것은 보안상 민감합니다. "쿠키 저장"을 켠 경우에만 저장됩니다.
+COOKIE_PASSWORD = "CHANGE_THIS_TO_A_RANDOM_LONG_SECRET_32CHARS_PLUS"
 
 def cookies() -> EncryptedCookieManager:
     if "cookie_mgr" not in st.session_state:
         st.session_state["cookie_mgr"] = EncryptedCookieManager(
             prefix="failog_",
-            password="CHANGE_THIS_TO_A_RANDOM_LONG_SECRET_32CHARS_PLUS",
+            password=COOKIE_PASSWORD,
         )
     return st.session_state["cookie_mgr"]
 
@@ -87,60 +95,44 @@ def cookie_ready() -> bool:
         return False
 
 def ck_get(key: str, default: str = "") -> str:
-    mgr = cookies()
-    v = mgr.get(key) if cookie_ready() else None
-    return default if v is None else str(v)
-
-def ck_set(key: str, value: str):
-    mgr = cookies()
-    if cookie_ready():
-        mgr[key] = str(value if value is not None else "")
-        mgr.save()
-
-def get_or_create_user_id() -> str:
-    # 1) 쿠키 준비되면 쿠키 uid 우선
-    if cookie_ready():
-        uid = ck_get("uid", "").strip()
-        if uid:
-            st.session_state["user_id"] = uid
-            return uid
-
-        # 쿠키 준비됐는데 uid 없으면 생성해서 쿠키 저장
-        new_uid = str(uuid.uuid4())
-        st.session_state["user_id"] = new_uid
-        ck_set("uid", new_uid)
-        st.rerun()
-
-    # 2) 쿠키가 아직 준비 안 됐으면: 세션 임시 uid로 앱은 일단 렌더되게 둠
-    if not st.session_state.get("user_id"):
-        st.session_state["user_id"] = str(uuid.uuid4())
-
-    # 안내만 띄우고 stop은 하지 않음 (렌더가 끝까지 가야 ready가 뜸)
-    st.info("쿠키 초기화 중… 초기화가 끝나면 자동으로 고정 user_id로 전환돼요.")
-    return st.session_state["user_id"]
-
-
-def ck_get(key: str, default: str = "") -> str:
-    mgr = cookies()
-    v = mgr.get(key)
-    if v is None:
+    # ready 전에는 절대 mgr.get 호출 금지
+    if not cookie_ready():
         return default
-    return str(v)
-
-
-def ck_set(key: str, value: str):
-    mgr = cookies()
-    mgr[key] = str(value if value is not None else "")
-    mgr.save()
-
-
-def ck_del(key: str):
     mgr = cookies()
     try:
-        del mgr[key]
-        mgr.save()
+        v = mgr.get(key)
+        return default if v is None else str(v)
+    except CookiesNotReady:
+        return default
     except Exception:
-        pass
+        return default
+
+def ck_set(key: str, value: str):
+    # ready 전에는 절대 mgr[...] / save 호출 금지
+    if not cookie_ready():
+        return
+    mgr = cookies()
+    try:
+        mgr[key] = str(value if value is not None else "")
+        mgr.save()
+    except CookiesNotReady:
+        return
+    except Exception:
+        return
+
+def ck_del(key: str):
+    if not cookie_ready():
+        return
+    mgr = cookies()
+    try:
+        # __contains__도 내부적으로 cookies를 읽을 수 있어 안전하게 try 안에서 처리
+        if key in mgr:
+            del mgr[key]
+            mgr.save()
+    except CookiesNotReady:
+        return
+    except Exception:
+        return
 
 
 # -------------------------
@@ -215,21 +207,29 @@ hr {{
 
 
 # -------------------------
-# Stable device user_id (COOKIE)
+# Stable device user_id (COOKIE, READY-SAFE)
 # -------------------------
 def get_or_create_user_id() -> str:
-    if st.session_state.get("user_id"):
-        return st.session_state["user_id"]
+    # 1) 쿠키가 ready이면: cookie uid를 source of truth로 고정
+    if cookie_ready():
+        uid = ck_get("uid", "").strip()
+        if uid:
+            st.session_state["user_id"] = uid
+            return uid
 
-    uid = ck_get("uid", "").strip()  # stored as failog_uid cookie key "uid" because prefix="failog_"
-    if uid:
-        st.session_state["user_id"] = uid
-        return uid
+        # 쿠키 ready인데 uid가 없으면 생성 후 저장
+        new_uid = str(uuid.uuid4())
+        st.session_state["user_id"] = new_uid
+        ck_set("uid", new_uid)
+        st.rerun()
 
-    new_uid = str(uuid.uuid4())
-    st.session_state["user_id"] = new_uid
-    ck_set("uid", new_uid)
-    st.rerun()
+    # 2) 쿠키 not-ready이면: 임시 session uid로 앱을 끝까지 렌더 (ready 뜰 기회를 줌)
+    if not st.session_state.get("user_id"):
+        st.session_state["user_id"] = str(uuid.uuid4())
+
+    # 안내만(중단 금지)
+    st.info("쿠키 초기화 중… 잠시 후 자동으로 고정 user_id로 전환돼요.")
+    return st.session_state["user_id"]
 
 
 # -------------------------
@@ -240,10 +240,8 @@ def conn():
     c.execute("PRAGMA foreign_keys = ON;")
     return c
 
-
 def now_iso() -> str:
     return datetime.now(KST).isoformat(timespec="seconds")
-
 
 def init_db():
     c = conn()
@@ -288,14 +286,11 @@ def init_db():
 def week_start(d: date) -> date:
     return d - timedelta(days=d.weekday())
 
-
 def week_days(ws: date) -> List[date]:
     return [ws + timedelta(days=i) for i in range(7)]
 
-
 def korean_dow(i: int) -> str:
     return ["월", "화", "수", "목", "금", "토", "일"][i]
-
 
 def month_grid(year: int, month: int) -> List[List[Optional[date]]]:
     first = date(year, month, 1)
@@ -336,7 +331,6 @@ def list_habits(user_id: str, active_only: bool = True) -> pd.DataFrame:
     c.close()
     return df
 
-
 def add_habit(user_id: str, title: str, dows: List[int]):
     title = (title or "").strip()
     if not title:
@@ -358,7 +352,6 @@ def add_habit(user_id: str, title: str, dows: List[int]):
     c.commit()
     c.close()
 
-
 def set_habit_active(user_id: str, habit_id: int, active: bool):
     c = conn()
     c.execute(
@@ -367,7 +360,6 @@ def set_habit_active(user_id: str, habit_id: int, active: bool):
     )
     c.commit()
     c.close()
-
 
 def delete_habit(user_id: str, habit_id: int):
     today = date.today().isoformat()
@@ -383,7 +375,6 @@ def delete_habit(user_id: str, habit_id: int):
     cur.execute("DELETE FROM habits WHERE user_id=? AND id=?", (user_id, habit_id))
     c.commit()
     c.close()
-
 
 def ensure_week_habit_tasks(user_id: str, ws: date):
     habits = list_habits(user_id, active_only=True)
@@ -410,7 +401,6 @@ def ensure_week_habit_tasks(user_id: str, ws: date):
     c.commit()
     c.close()
 
-
 def add_plan_task(user_id: str, d: date, text: str):
     text = (text or "").strip()
     if not text:
@@ -427,13 +417,11 @@ def add_plan_task(user_id: str, d: date, text: str):
     c.commit()
     c.close()
 
-
 def delete_task(user_id: str, task_id: int):
     c = conn()
     c.execute("DELETE FROM tasks WHERE user_id=? AND id=?", (user_id, task_id))
     c.commit()
     c.close()
-
 
 def list_tasks_for_date(user_id: str, d: date) -> pd.DataFrame:
     c = conn()
@@ -450,7 +438,6 @@ def list_tasks_for_date(user_id: str, d: date) -> pd.DataFrame:
     c.close()
     return df
 
-
 def update_task_status(user_id: str, task_id: int, status: str):
     c = conn()
     c.execute(
@@ -465,7 +452,6 @@ def update_task_status(user_id: str, task_id: int, status: str):
     c.commit()
     c.close()
 
-
 def update_task_fail(user_id: str, task_id: int, reason: str):
     reason = (reason or "").strip() or "이유 미기록"
     c = conn()
@@ -475,7 +461,6 @@ def update_task_fail(user_id: str, task_id: int, reason: str):
     )
     c.commit()
     c.close()
-
 
 def get_tasks_range(user_id: str, start_d: date, end_d: date) -> pd.DataFrame:
     c = conn()
@@ -492,7 +477,6 @@ def get_tasks_range(user_id: str, start_d: date, end_d: date) -> pd.DataFrame:
     c.close()
     return df
 
-
 def get_all_failures(user_id: str, limit: int = 350) -> pd.DataFrame:
     c = conn()
     df = pd.read_sql_query(
@@ -508,7 +492,6 @@ def get_all_failures(user_id: str, limit: int = 350) -> pd.DataFrame:
     )
     c.close()
     return df
-
 
 def count_today_todos(user_id: str) -> int:
     today = date.today().isoformat()
@@ -534,7 +517,6 @@ def parse_hhmm(s: str) -> time:
     mm = max(0, min(59, mm))
     return time(hh, mm)
 
-
 def should_remind(now_dt: datetime, remind_t: time, window_min: int) -> bool:
     target = datetime.combine(now_dt.date(), remind_t, tzinfo=KST)
     delta_min = abs((now_dt - target).total_seconds()) / 60.0
@@ -542,7 +524,7 @@ def should_remind(now_dt: datetime, remind_t: time, window_min: int) -> bool:
 
 
 # -------------------------
-# OpenAI (COOKIE)
+# OpenAI (COOKIE, READY-SAFE)
 # -------------------------
 def openai_client(api_key: str):
     if OpenAI is None:
@@ -551,24 +533,20 @@ def openai_client(api_key: str):
         raise RuntimeError("OpenAI API Key가 비어 있어요.")
     return OpenAI(api_key=api_key.strip())
 
-
 def ck_openai_key() -> str:
     return ck_get("openai_key", "").strip()
 
-
 def ck_openai_model() -> str:
-    return ck_get("openai_model", "gpt-4o-mini").strip() or "gpt-4o-mini"
-
+    m = ck_get("openai_model", "gpt-4o-mini").strip()
+    return m if m else "gpt-4o-mini"
 
 def effective_openai_key() -> str:
     sk = st.session_state.get("openai_api_key", "")
     return sk.strip() if sk and sk.strip() else ck_openai_key()
 
-
 def effective_openai_model() -> str:
     sm = st.session_state.get("openai_model", "")
     return sm.strip() if sm and sm.strip() else ck_openai_model()
-
 
 def set_ck_openai(api_key: str, model: str):
     ck_set("openai_key", (api_key or "").strip())
@@ -613,13 +591,11 @@ COACH_SCHEMA = """
 - repeated_2w=true 항목이 하나라도 있으면 해당 원인에는 creative_advice_when_repeated_2w를 반드시 채워라
 """
 
-
 def normalize_reason(text: str) -> str:
     t = (text or "").strip().lower()
     t = re.sub(r"\s+", " ", t)
     t = re.sub(r"[^\w\s가-힣]", "", t)
     return t
-
 
 def repeated_reason_flags(df_fail: pd.DataFrame) -> Dict[str, bool]:
     if df_fail.empty:
@@ -635,7 +611,6 @@ def repeated_reason_flags(df_fail: pd.DataFrame) -> Dict[str, bool]:
         if len(dates) >= 2 and (dates[-1] - dates[0]).days >= 14:
             flags[rnorm] = True
     return flags
-
 
 def compute_user_signals(user_id: str, days: int = 28) -> Dict[str, Any]:
     end = date.today()
@@ -691,7 +666,6 @@ def compute_user_signals(user_id: str, days: int = 28) -> Dict[str, Any]:
         "top_reasons": top_reasons,
     }
 
-
 def llm_weekly_reason_analysis(api_key: str, model: str, reasons: List[str]) -> Dict[str, Any]:
     client = openai_client(api_key)
     prompt = f"""
@@ -723,7 +697,6 @@ def llm_weekly_reason_analysis(api_key: str, model: str, reasons: List[str]) -> 
         m = re.search(r"\{.*\}", text, flags=re.DOTALL)
         return json.loads(m.group(0)) if m else {"groups": []}
 
-
 def llm_overall_coaching(api_key: str, model: str, fail_items: List[Dict[str, Any]], signals: Dict[str, Any]) -> Dict[str, Any]:
     client = openai_client(api_key)
     prompt = f"""
@@ -752,7 +725,6 @@ def llm_overall_coaching(api_key: str, model: str, fail_items: List[Dict[str, An
     except json.JSONDecodeError:
         m = re.search(r"\{.*\}", text, flags=re.DOTALL)
         return json.loads(m.group(0)) if m else {"top_causes": []}
-
 
 def llm_chat(api_key: str, model: str, system_context: str, msgs: List[Dict[str, str]]) -> str:
     client = openai_client(api_key)
@@ -798,7 +770,6 @@ WEATHER_CODE_KO = {
     99: "뇌우(우박 강)",
 }
 
-
 @st.cache_data(ttl=60 * 60, show_spinner=False)
 def geocode_city(city_name: str) -> Optional[Dict[str, Any]]:
     city_name = (city_name or "").strip()
@@ -811,7 +782,6 @@ def geocode_city(city_name: str) -> Optional[Dict[str, Any]]:
     js = r.json()
     results = js.get("results") or []
     return results[0] if results else None
-
 
 @st.cache_data(ttl=60 * 30, show_spinner=False)
 def fetch_daily_weather(lat: float, lon: float, d: date, tz: str = "Asia/Seoul") -> Optional[Dict[str, Any]]:
@@ -854,7 +824,6 @@ def fetch_daily_weather(lat: float, lon: float, d: date, tz: str = "Asia/Seoul")
         "precip_prob": pprob,
     }
 
-
 def weather_card(selected: date):
     st.markdown("<div class='card'>", unsafe_allow_html=True)
     st.markdown("### 🌤️ Weather (Open-Meteo)")
@@ -872,7 +841,7 @@ def weather_card(selected: date):
         show = st.toggle("표시", value=(ck_get("weather_show", "true") == "true"), key="weather_show_toggle")
         ck_set("weather_show", "true" if show else "false")
 
-    if not show:
+    if (ck_get("weather_show", "true") != "true"):
         st.markdown("<div class='small'>날씨 표시가 꺼져 있어요.</div>", unsafe_allow_html=True)
         st.markdown("</div>", unsafe_allow_html=True)
         return
@@ -938,7 +907,6 @@ def try_register_korean_font() -> str:
     st.session_state["__pdf_font_name"] = "Helvetica"
     return "Helvetica"
 
-
 def failures_by_dow(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame({"dow": ["월", "화", "수", "목", "금", "토", "일"], "fail_count": [0] * 7})
@@ -951,7 +919,6 @@ def failures_by_dow(df: pd.DataFrame) -> pd.DataFrame:
         rows.append({"dow": dname, "fail_count": int((x["task_date"].map(lambda d: d.weekday()) == i).sum())})
     return pd.DataFrame(rows)
 
-
 def top_reasons(df: pd.DataFrame, topk: int = 8) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame(columns=["reason", "count"])
@@ -960,7 +927,6 @@ def top_reasons(df: pd.DataFrame, topk: int = 8) -> pd.DataFrame:
     s = s[s != ""]
     vc = s.value_counts().head(topk)
     return pd.DataFrame({"reason": vc.index.tolist(), "count": vc.values.tolist()})
-
 
 def weekly_reason_trend(user_id: str, weeks: int = 12, topk: int = 6) -> pd.DataFrame:
     end = date.today()
@@ -981,9 +947,11 @@ def weekly_reason_trend(user_id: str, weeks: int = 12, topk: int = 6) -> pd.Data
     df = df[df["reason"].isin(top)].copy()
 
     df["week"] = df["task_date"].map(lambda d: week_start(d).isoformat())
-    out = df.groupby(["week", "reason"]).size().reset_index(name="count").sort_values(["week", "count"], ascending=[True, False])
+    out = (
+        df.groupby(["week", "reason"]).size().reset_index(name="count")
+        .sort_values(["week", "count"], ascending=[True, False])
+    )
     return out
-
 
 def make_matplotlib_bar_png(data: pd.DataFrame, xcol: str, ycol: str, title: str) -> bytes:
     fig = plt.figure(figsize=(6.2, 2.4), dpi=160)
@@ -999,7 +967,6 @@ def make_matplotlib_bar_png(data: pd.DataFrame, xcol: str, ycol: str, title: str
     plt.close(fig)
     buf.seek(0)
     return buf.read()
-
 
 def build_weekly_pdf_bytes(user_id: str, ws: date, city_label: str = "") -> bytes:
     we = ws + timedelta(days=6)
@@ -1130,7 +1097,7 @@ def screen_planner(user_id: str):
     ws = week_start(selected)
     ensure_week_habit_tasks(user_id, ws)
 
-    # Reminder settings in COOKIE
+    # Reminder settings in COOKIE (ready-safe via ck_get)
     en = (ck_get("rem_enabled", "true").lower() == "true")
     rt_str = ck_get("rem_time", "21:30")
     win_str = ck_get("rem_win", "15")
@@ -1624,7 +1591,7 @@ def screen_failures(user_id: str):
 
 
 # -------------------------
-# Bottom OpenAI panel (COOKIE)
+# Bottom OpenAI panel (COOKIE, READY-SAFE)
 # -------------------------
 def render_openai_bottom_panel():
     st.markdown("<hr/>", unsafe_allow_html=True)
@@ -1672,7 +1639,7 @@ def render_openai_bottom_panel():
             st.success("쿠키 저장값을 삭제했어요.")
             st.rerun()
     with c:
-        st.caption("쿠키 저장을 켜면 같은 브라우저에서는 새로고침/재접속해도 유지돼요. (보안상 공유 PC에서는 끄세요)")
+        st.caption("쿠키 저장을 켜면 같은 브라우저에서는 새로고침/재접속해도 유지돼요. (공유 PC에서는 끄세요)")
 
 
 # -------------------------
@@ -1706,7 +1673,8 @@ def main():
     inject_css()
     init_db()
 
-    # IMPORTANT: cookie user_id
+    # ❌ cookies()를 여기서 강제 호출하지 않음 (not-ready 문제를 앞당길 수 있음)
+
     user_id = get_or_create_user_id()
 
     st.markdown("# FAILOG")
@@ -1727,5 +1695,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
