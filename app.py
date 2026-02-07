@@ -10,7 +10,6 @@
 #    - OpenAI category clustering/labeling (max 7 categories)
 #    - Category map built from last 12 weeks, cached in DB, refreshable by button
 # ✅ Weekly PDF export (Korean font embedded via auto-download; recommend bundling font in repo)
-# ✅ UI: “red-ish” accents overridden to cream yellow (#FFF2B2) to match blue/white theme
 #
 # Install:
 #   pip install streamlit pandas altair requests reportlab matplotlib openai
@@ -73,7 +72,6 @@ DB_PATH = "planner.db"
 
 # Theme / colors
 ACCENT_BLUE = "#A0C4F2"
-CREAM_YELLOW = "#FFF2B2"
 CREAM_YELLOW_BORDER = "#E6DCA0"
 TEXT_DARK = "#1f2430"
 
@@ -152,23 +150,6 @@ hr {{
   border-top: 1px solid rgba(160,196,242,0.35);
 }}
 
-/* Buttons: force cream yellow to remove any red-ish styling */
-div[data-testid="stButton"] > button {{
-  border-radius: 14px !important;
-  white-space: nowrap !important;
-  background: {CREAM_YELLOW} !important;
-  border: 1px solid {CREAM_YELLOW_BORDER} !important;
-  color: {TEXT_DARK} !important;
-  box-shadow: 0 6px 18px rgba(31,36,48,0.06) !important;
-}}
-div[data-testid="stButton"] > button:hover {{
-  filter: brightness(0.985);
-  border-color: rgba(31,36,48,0.16) !important;
-}}
-div[data-testid="stButton"] > button:active {{
-  transform: translateY(1px);
-}}
-
 /* Inputs */
 [data-testid="stTextInput"] input,
 [data-testid="stTextArea"] textarea {{
@@ -183,25 +164,14 @@ div[data-testid="stButton"] > button:active {{
 }}
 
 /* Toggle / checkbox accents (best-effort; BaseWeb components) */
-[data-baseweb="checkbox"] input:checked + div {{
-  background: {CREAM_YELLOW} !important;
-  border-color: {CREAM_YELLOW_BORDER} !important;
-}}
 [data-baseweb="checkbox"] svg {{
   color: {TEXT_DARK} !important;
 }}
-[data-baseweb="toggle"] div[role="switch"][aria-checked="true"] {{
-  background: {CREAM_YELLOW} !important;
 }}
 [data-baseweb="toggle"] div[role="switch"] {{
   box-shadow: none !important;
 }}
 /* Multi-select selected pills */
-.stMultiSelect span[data-baseweb="tag"] {{
-  background: rgba(255,242,178,0.75) !important;
-  border: 1px solid {CREAM_YELLOW_BORDER} !important;
-  color: {TEXT_DARK} !important;
-}}
 
 /* Hero title */
 .failog-hero {{
@@ -253,12 +223,6 @@ def render_hero():
 <div class="failog-hero">
   <div class="failog-title">FAILOG</div>
   <div class="failog-sub">실패를 성공으로 — 계획과 습관의 실패를 기록하고, 패턴을 이해하고, 다음 주를 설계해요.</div>
-  <div class="failog-badges">
-    <span class="failog-badge">🌤️ Weather (Open-Meteo)</span>
-    <span class="failog-badge">📊 Trend Dashboard</span>
-    <span class="failog-badge">🧾 Weekly PDF</span>
-    <span class="failog-badge">🧠 AI Categorization</span>
-  </div>
 </div>
 """,
         unsafe_allow_html=True,
@@ -2095,3 +2059,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
