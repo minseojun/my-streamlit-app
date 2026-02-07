@@ -1325,11 +1325,4 @@ if __name__ == "__main__":
 
 import streamlit as st
 
-st.divider()
-st.caption("DEBUG (원인 확인용)")
-st.write({
-    "user_id(session)": st.session_state.get("user_id"),
-    "ls_uid": st.session_state.get("ls_uid"),
-    "ls_openai_key_len": len(st.session_state.get("ls_openai_key") or ""),
-    "ls_openai_model": st.session_state.get("ls_openai_model"),
-})
+st.caption(f"DEBUG uid={st.session_state.get('user_id')} / origin={st.query_params}")
