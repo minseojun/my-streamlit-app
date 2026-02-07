@@ -5,4 +5,7 @@ altair
 extra-streamlit-components
 streamlit-autorefresh
 streamlit-local-storage
-
+streamlit-cookies-manager
+matplotlib
+reportlab 
+requests
