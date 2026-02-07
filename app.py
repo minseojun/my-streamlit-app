@@ -71,27 +71,53 @@ ACCENT = "#A0C4F2"
 # NOTE:
 # - EncryptedCookieManager는 쿠키 값을 암호화해 저장 (브라우저에 저장되지만 평문 노출이 덜함)
 # - OpenAI 키를 쿠키에 저장하는 것은 보안상 민감할 수 있어요. "저장 토글"로만 저장하도록 해둠.
+
 def cookies() -> EncryptedCookieManager:
     if "cookie_mgr" not in st.session_state:
         st.session_state["cookie_mgr"] = EncryptedCookieManager(
             prefix="failog_",
             password="CHANGE_THIS_TO_A_RANDOM_LONG_SECRET_32CHARS_PLUS",
         )
-    mgr = st.session_state["cookie_mgr"]
+    return st.session_state["cookie_mgr"]
 
-    if not mgr.ready():
-        st.markdown("<div class='card'>", unsafe_allow_html=True)
-        st.info("쿠키 초기화 중이에요. 잠시만요… (자동으로 다시 시도합니다)")
-        st.markdown("</div>", unsafe_allow_html=True)
+def cookie_ready() -> bool:
+    try:
+        return cookies().ready()
+    except Exception:
+        return False
 
-        # 한 번만 rerun
-        if not st.session_state.get("__cookie_retry__", False):
-            st.session_state["__cookie_retry__"] = True
-            st.rerun()
+def ck_get(key: str, default: str = "") -> str:
+    mgr = cookies()
+    v = mgr.get(key) if cookie_ready() else None
+    return default if v is None else str(v)
 
-        st.stop()
+def ck_set(key: str, value: str):
+    mgr = cookies()
+    if cookie_ready():
+        mgr[key] = str(value if value is not None else "")
+        mgr.save()
 
-    return mgr
+def get_or_create_user_id() -> str:
+    # 1) 쿠키 준비되면 쿠키 uid 우선
+    if cookie_ready():
+        uid = ck_get("uid", "").strip()
+        if uid:
+            st.session_state["user_id"] = uid
+            return uid
+
+        # 쿠키 준비됐는데 uid 없으면 생성해서 쿠키 저장
+        new_uid = str(uuid.uuid4())
+        st.session_state["user_id"] = new_uid
+        ck_set("uid", new_uid)
+        st.rerun()
+
+    # 2) 쿠키가 아직 준비 안 됐으면: 세션 임시 uid로 앱은 일단 렌더되게 둠
+    if not st.session_state.get("user_id"):
+        st.session_state["user_id"] = str(uuid.uuid4())
+
+    # 안내만 띄우고 stop은 하지 않음 (렌더가 끝까지 가야 ready가 뜸)
+    st.info("쿠키 초기화 중… 초기화가 끝나면 자동으로 고정 user_id로 전환돼요.")
+    return st.session_state["user_id"]
 
 
 def ck_get(key: str, default: str = "") -> str:
@@ -1680,9 +1706,6 @@ def main():
     inject_css()
     init_db()
 
-    # init cookies early
-    _ = cookies()
-
     # IMPORTANT: cookie user_id
     user_id = get_or_create_user_id()
 
@@ -1704,4 +1727,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
