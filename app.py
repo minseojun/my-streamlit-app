@@ -51,7 +51,6 @@ DB_PATH = "planner.db"
 
 # Theme / colors
 ACCENT_BLUE = "#A0C4F2"
-CREAM_YELLOW_BORDER = "#E6DCA0"
 TEXT_DARK = "#1f2430"
 
 # Dashboard fixed params (per your request)
@@ -65,6 +64,9 @@ FONTS_DIR = "fonts"
 KOREAN_FONT_PATH = os.path.join(FONTS_DIR, "NanumGothic-Regular.ttf")
 KOREAN_FONT_NAME = "NanumGothicRegular"
 NANUM_TTF_URL = "https://github.com/google/fonts/raw/main/ofl/nanumgothic/NanumGothic-Regular.ttf"
+
+# Consent (privacy/AI usage)
+CONSENT_COOKIE_KEY = "failog_ai_consent"  # "true"/"false"
 
 
 # ============================================================
@@ -134,16 +136,8 @@ hr {{
 [data-testid="stTextInput"] input:focus,
 [data-testid="stTextArea"] textarea:focus {{
   outline: none !important;
-  box-shadow: 0 0 0 4px rgba(255,242,178,0.65) !important;
-  border-color: rgba(230,220,160,0.95) !important;
-}}
-
-/* Toggle / checkbox accents (best-effort; BaseWeb components) */
-[data-baseweb="checkbox"] svg {{
-  color: {TEXT_DARK} !important;
-}}
-[data-baseweb="toggle"] div[role="switch"] {{
-  box-shadow: none !important;
+  box-shadow: 0 0 0 4px rgba(160,196,242,0.35) !important;
+  border-color: rgba(160,196,242,0.95) !important;
 }}
 
 /* Hero title */
@@ -155,34 +149,17 @@ hr {{
   box-shadow: 0 12px 34px rgba(160,196,242,0.14);
 }}
 .failog-title {{
-  font-size: 2.35rem;
+  font-size: 2.55rem;
   font-weight: 900;
   letter-spacing: -0.02em;
   margin: 0;
-  line-height: 1.12;
+  line-height: 1.08;
   color: {TEXT_DARK};
 }}
 .failog-sub {{
   margin-top: 6px;
   color: rgba(31,36,48,0.66);
   font-size: 1.02rem;
-}}
-.failog-badges {{
-  margin-top: 10px;
-  display: flex;
-  gap: 8px;
-  flex-wrap: wrap;
-}}
-.failog-badge {{
-  display:inline-flex;
-  align-items:center;
-  gap:6px;
-  padding: 5px 10px;
-  border-radius: 999px;
-  background: rgba(255,242,178,0.55);
-  border: 1px solid {CREAM_YELLOW_BORDER};
-  font-size: 0.86rem;
-  color: rgba(31,36,48,0.80);
 }}
 </style>
 """,
@@ -247,17 +224,16 @@ def ck_set(key: str, value: str, expires_days: int = 3650):
         return
     v = "" if value is None else str(value)
     try:
-        # extra_streamlit_components CookieManager signatures vary by version.
-        # We'll just try the common forms safely.
-        cm.set(key, v)
+        # Some versions support expires_at_days
+        if hasattr(cm, "set") and "expires_at_days" in cm.set.__code__.co_varnames:
+            cm.set(key, v, expires_at_days=int(expires_days))
+        else:
+            cm.set(key, v)
     except Exception:
         try:
-            cm.set(key, v, expires_at_days=int(expires_days))
+            cm.set(key, v)
         except Exception:
-            try:
-                cm.set(key, v, expires_at_days=expires_days)
-            except Exception:
-                pass
+            pass
 
 
 def ck_del(key: str):
@@ -275,6 +251,31 @@ def ck_del(key: str):
         cm.set(key, "")
     except Exception:
         pass
+
+
+# ============================================================
+# Consent helpers
+# ============================================================
+def consent_value() -> bool:
+    # 1) session_state first
+    if "ai_consent" in st.session_state:
+        return bool(st.session_state["ai_consent"])
+    # 2) cookie best-effort
+    v = ck_get(CONSENT_COOKIE_KEY, "").strip().lower()
+    if v in ("true", "1", "yes", "y"):
+        st.session_state["ai_consent"] = True
+        return True
+    if v in ("false", "0", "no", "n"):
+        st.session_state["ai_consent"] = False
+        return False
+    # default: not consented
+    st.session_state["ai_consent"] = False
+    return False
+
+
+def set_consent(v: bool):
+    st.session_state["ai_consent"] = bool(v)
+    ck_set(CONSENT_COOKIE_KEY, "true" if v else "false")
 
 
 # ============================================================
@@ -326,6 +327,7 @@ def init_db():
         """
     )
 
+    # Category map cache (per user)
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS category_maps (
@@ -704,7 +706,12 @@ def compute_user_signals(user_id: str, days: int = 28) -> Dict[str, Any]:
     start = end - timedelta(days=days - 1)
     df = get_tasks_range(user_id, start, end)
     if df.empty:
-        return {"has_data": False, "window_days": days, "window_start": start.isoformat(), "window_end": end.isoformat()}
+        return {
+            "has_data": False,
+            "window_days": days,
+            "window_start": start.isoformat(),
+            "window_end": end.isoformat(),
+        }
 
     df = df.copy()
     df["task_date"] = pd.to_datetime(df["task_date"]).dt.date
@@ -871,22 +878,17 @@ def list_recent_failure_reasons(user_id: str, weeks: int) -> List[str]:
 
 
 def llm_build_category_map(api_key: str, model: str, reasons: List[str], max_categories: int) -> Dict[str, Any]:
-    """
-    ✅ FIXED:
-    - schema 변수를 파이썬에서 먼저 만들고 프롬프트에 넣음 (NameError 방지)
-    - 결과 shape를 정규화해서 downstream KeyError 방지
-    """
     client = openai_client(api_key)
 
     reasons_limited = reasons[:120]
-    schema = CATEGORY_SCHEMA.replace("__MAX_CATEGORIES__", str(int(max_categories)))
+    schema = CATEGORY_SCHEMA.replace("__MAX_CATEGORIES__", str(max_categories))
 
     prompt = f"""
 너는 사용자의 '실패 원인' 텍스트들을 비슷한 것끼리 묶어 카테고리로 분류해.
 목표:
 - 사용자 표현이 다양해도 의미가 비슷하면 같은 카테고리로 묶기
 - 카테고리명은 짧고 직관적으로
-- 전체 카테고리는 최대 {int(max_categories)}개
+- 전체 카테고리는 최대 {max_categories}개
 - 가능한 한 '기타'는 최소화하되, 정말 애매하면 '기타'를 포함해도 됨
 
 실패 원인 원문 목록:
@@ -904,22 +906,12 @@ def llm_build_category_map(api_key: str, model: str, reasons: List[str], max_cat
         ],
         temperature=0.35,
     )
-
     text = (resp.choices[0].message.content or "").strip()
     try:
-        payload = json.loads(text)
+        return json.loads(text)
     except json.JSONDecodeError:
         m = re.search(r"\{.*\}", text, flags=re.DOTALL)
-        payload = json.loads(m.group(0)) if m else {"categories": [], "mapping": {}}
-
-    if not isinstance(payload, dict):
-        return {"categories": [], "mapping": {}}
-    if not isinstance(payload.get("categories", []), list):
-        payload["categories"] = []
-    if not isinstance(payload.get("mapping", {}), dict):
-        payload["mapping"] = {}
-
-    return payload
+        return json.loads(m.group(0)) if m else {"categories": [], "mapping": {}}
 
 
 def db_get_latest_category_map(user_id: str) -> Optional[Dict[str, Any]]:
@@ -961,7 +953,7 @@ def get_or_build_category_map(
 ) -> Tuple[Optional[Dict[str, Any]], str]:
     if not force_refresh:
         cached = db_get_latest_category_map(user_id)
-        if cached and isinstance(cached, dict) and isinstance(cached.get("mapping", None), dict) and len(cached.get("mapping", {})) > 0:
+        if cached and isinstance(cached, dict) and isinstance(cached.get("mapping", None), dict) and cached.get("mapping"):
             return cached, "캐시된 카테고리 맵을 사용 중"
 
     reasons = list_recent_failure_reasons(user_id, weeks=CATEGORY_MAP_WINDOW_WEEKS)
@@ -974,6 +966,7 @@ def get_or_build_category_map(
     if not isinstance(mapping, dict) or len(mapping) == 0:
         return None, "카테고리 맵 생성 결과가 비어 있어요. 다시 시도해 주세요."
 
+    # save and return
     db_save_category_map(user_id, payload, window_weeks=CATEGORY_MAP_WINDOW_WEEKS, max_categories=CATEGORY_MAX)
     return payload, "카테고리 맵을 새로 만들었어요"
 
@@ -1359,6 +1352,7 @@ def screen_planner(user_id: str):
     ws = week_start(selected)
     ensure_week_habit_tasks(user_id, ws)
 
+    # Reminder settings (prefs)
     en = (ck_get("failog_rem_enabled", "true").lower() == "true")
     rt_str = ck_get("failog_rem_time", "21:30")
     win_str = ck_get("failog_rem_win", "15")
@@ -1611,6 +1605,9 @@ def screen_failures(user_id: str):
 
     tab1, tab2, tab3 = st.tabs(["대시보드", "주간 분석/코칭", "PDF 리포트"])
 
+    # -------------------------
+    # Dashboard
+    # -------------------------
     with tab1:
         st.markdown("<div class='card'>", unsafe_allow_html=True)
         st.markdown("### 📊 Dashboard")
@@ -1620,9 +1617,7 @@ def screen_failures(user_id: str):
             f"카테고리 맵: 최근 {CATEGORY_MAP_WINDOW_WEEKS}주 기반 (최대 {CATEGORY_MAX}개)"
         )
 
-        api_key = effective_openai_key()
-        model = effective_openai_model()
-
+        # Fail by DOW (this week)
         st.markdown("**이번 주 실패(요일 분포)**")
         dow_df = failures_by_dow(df)
         c_dow = (
@@ -1640,6 +1635,14 @@ def screen_failures(user_id: str):
         st.markdown("<hr/>", unsafe_allow_html=True)
         st.markdown("**실패 원인 트렌드(주별, 카테고리)**")
 
+        # Consent gate for AI features
+        if not consent_value():
+            st.info("AI 기능 사용 동의가 필요해요. (하단 ‘데이터/AI 안내 및 동의’에서 체크)")
+            st.markdown("</div>", unsafe_allow_html=True)
+            return
+
+        api_key = effective_openai_key()
+        model = effective_openai_model()
         if not api_key:
             st.info("OpenAI 키가 설정되면 ‘카테고리 트렌드’가 표시돼요. (하단 OpenAI 설정)")
             st.markdown("</div>", unsafe_allow_html=True)
@@ -1682,14 +1685,12 @@ def screen_failures(user_id: str):
                         st.write("- 예시:", ", ".join([str(x) for x in examples[:3]]))
 
         trend = weekly_category_trend(user_id, weeks=DASH_TREND_WEEKS, topk=DASH_TOPK, mapping=mapping)
-
         if trend.empty:
             st.info("최근 기간에 실패 원인 데이터가 부족해서 트렌드를 만들 수 없어요.")
             st.markdown("</div>", unsafe_allow_html=True)
             return
 
         y_axis = alt.Axis(title="실패 횟수", tickMinStep=1)
-
         c_trend = (
             alt.Chart(trend)
             .mark_line(point=True)
@@ -1702,36 +1703,28 @@ def screen_failures(user_id: str):
             .properties(height=260)
         )
         st.altair_chart(c_trend, use_container_width=True)
-
         st.caption("X축: 주 시작일(월요일) · Y축: 그 주에 해당 카테고리로 기록된 실패 원인 횟수(실제 횟수)")
+
         st.markdown("</div>", unsafe_allow_html=True)
 
+    # -------------------------
+    # Weekly analysis / coaching
+    # (변경점 #1: 주간 실패 차트 제거)
+    # -------------------------
     with tab2:
         st.markdown("<div class='card'>", unsafe_allow_html=True)
-        st.markdown("### 주간 실패 차트")
-        days = week_days(ws)
-        chart_rows = [{"dow": korean_dow(d.weekday()), "fail_count": int((fails["task_date"] == d).sum())} for d in days]
-        chart_df = pd.DataFrame(chart_rows)
+        st.markdown("### 주간 분석 / 코칭")
 
-        chart = (
-            alt.Chart(chart_df)
-            .mark_bar()
-            .encode(
-                x=alt.X("dow:N", sort=["월", "화", "수", "목", "금", "토", "일"], title=None),
-                y=alt.Y("fail_count:Q", title=None),
-                tooltip=["dow", "fail_count"],
-            )
-            .properties(height=155)
-        )
-        st.altair_chart(chart, use_container_width=True)
-        st.markdown("</div>", unsafe_allow_html=True)
-        st.write("")
+        # Consent gate for AI features
+        if not consent_value():
+            st.info("AI 기능 사용 동의가 필요해요. (하단 ‘데이터/AI 안내 및 동의’에서 체크)")
+            st.markdown("</div>", unsafe_allow_html=True)
+            return
 
         api_key = effective_openai_key()
         model = effective_openai_model()
 
-        st.markdown("<div class='card'>", unsafe_allow_html=True)
-        st.markdown("### 원인 주간 분석")
+        st.markdown("#### 원인 주간 분석")
 
         weekly_reasons = [r for r in fails["fail_reason"].fillna("").tolist() if str(r).strip()]
         if not api_key:
@@ -1755,11 +1748,8 @@ def screen_failures(user_id: str):
                         for s in (g.get("examples") or [])[:3]:
                             st.write(f"- {s}")
 
-        st.markdown("</div>", unsafe_allow_html=True)
-        st.write("")
-
-        st.markdown("<div class='card'>", unsafe_allow_html=True)
-        st.markdown("### 맞춤형 AI코칭")
+        st.markdown("<hr/>", unsafe_allow_html=True)
+        st.markdown("#### 맞춤형 AI코칭")
 
         if not api_key:
             st.info("OpenAI 키가 설정되면 코칭/챗봇이 표시돼요. (하단에서 키 입력)")
@@ -1816,6 +1806,7 @@ def screen_failures(user_id: str):
             st.caption("‘코칭 생성/갱신’을 눌러 코칭을 받아보세요.")
 
         st.markdown("<hr/>", unsafe_allow_html=True)
+        st.markdown("#### 코칭 챗봇")
 
         if "chat_messages" not in st.session_state:
             st.session_state["chat_messages"] = []
@@ -1865,6 +1856,9 @@ def screen_failures(user_id: str):
 
         st.markdown("</div>", unsafe_allow_html=True)
 
+    # -------------------------
+    # PDF report
+    # -------------------------
     with tab3:
         st.markdown("<div class='card'>", unsafe_allow_html=True)
         st.markdown("### 🧾 Weekly PDF 리포트 (한글 폰트 포함)")
@@ -1972,6 +1966,44 @@ def render_openai_bottom_panel():
 
 
 # ============================================================
+# Privacy / AI consent panel (변경점 #2)
+# ============================================================
+def render_privacy_ai_consent_panel():
+    st.markdown("<hr/>", unsafe_allow_html=True)
+    st.markdown("### 🔒 데이터/AI 안내 및 동의")
+
+    current = consent_value()
+
+    with st.container():
+        st.caption(
+            "실패 이유·생활 패턴은 개인에게 민감한 데이터일 수 있어요. "
+            "FAILOG는 아래 원칙으로 데이터를 다룹니다."
+        )
+
+        with st.expander("자세히 보기", expanded=False):
+            st.markdown(
+                """
+- **저장**: 계획/습관/체크/실패원인은 서버의 **SQLite(planner.db)**에 저장됩니다.  
+- **식별자**: user_id는 로그인 대신 **URL의 uid 파라미터**로 구분됩니다. (링크를 공유하면 동일 데이터가 보일 수 있어요)  
+- **쿠키**: OpenAI 키/모델, 알림/날씨 등 일부 설정은 **쿠키**에 저장될 수 있습니다. (브라우저 정책에 따라 제한 가능)  
+- **AI(OpenAI) 사용**:  
+  - *버튼을 눌러 요청한 경우에만* 실패 원인을 분석/카테고리화/코칭을 위해 OpenAI API가 호출됩니다.  
+  - 호출 시, 분석에 필요한 범위의 텍스트(실패 원인/요약된 패턴 등)가 전송될 수 있습니다.  
+  - 동의하지 않으면 AI 기능은 작동하지 않습니다.
+                """.strip()
+            )
+
+        checked = st.checkbox(
+            "위 내용을 이해했으며, OpenAI 기반 분석/코칭 기능 사용에 동의합니다.",
+            value=current,
+            key="ai_consent_checkbox",
+        )
+        if checked != current:
+            set_consent(bool(checked))
+            st.success("동의 설정이 저장됐어요.")
+
+
+# ============================================================
 # Top nav
 # ============================================================
 def top_nav():
@@ -2011,6 +2043,7 @@ def main():
         screen_failures(user_id)
 
     render_openai_bottom_panel()
+    render_privacy_ai_consent_panel()
 
 
 if __name__ == "__main__":
